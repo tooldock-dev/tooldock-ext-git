@@ -17,7 +17,7 @@
     "displayName": "Git 工具",
     "description": "簡單好上手的 Git 圖形介面：複製儲存庫、暫存與提交、推送、拉取、擷取；分支線圖與提交內容；切換、建立、合併分支；儲藏；逐段解決合併衝突",
     "icon": "🌿",
-    "engine": "^1.4.0",
+    "engine": "^1.6.0",
     "activationEvents": [],
     "contributes": {
       "views": [
@@ -43,11 +43,13 @@
         },
         {
           "id": "gitTool.pull",
-          "title": "Git 工具：拉取（pull）"
+          "title": "Git 工具：拉取（pull）",
+          "guarded": true
         },
         {
           "id": "gitTool.push",
-          "title": "Git 工具：推送（push）"
+          "title": "Git 工具：推送（push）",
+          "guarded": true
         },
         {
           "id": "gitTool.fetch",

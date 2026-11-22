@@ -290,6 +290,16 @@ exports.activate = (context) => {
   );
 };
 
+/** 其他擴充呼叫受保護指令（拉取、推送）時，確認對話框顯示的說明 */
+exports.guardSummary = (context, command) => {
+  const list = context.storage.get('repos', []);
+  const r = list.find((x) => x.id === context.storage.get('lastRepo', null)) || list[0];
+  const name = r ? `「${r.name}」（${r.root}）` : '目前選取的儲存庫';
+  if (command === 'gitTool.push') return `把${name}目前分支的提交推送到遠端`;
+  if (command === 'gitTool.pull') return `從遠端拉取提交並合併到${name}的目前分支`;
+  return null;
+};
+
 exports.deactivate = () => {
   pendingCommand = null;
   unwatch();
