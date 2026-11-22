@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <title>Git 工具</title>
+  <link rel="stylesheet" href="tooldock://sdk/ui-base.css">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <aside id="side">
+    <div id="repoBar">
+      <select id="repoSel" title="切換儲存庫"></select>
+      <div class="menu-wrap">
+        <button class="ib" id="addBtn" title="加入儲存庫">＋</button>
+        <div class="menu right" id="addMenu" hidden>
+          <button class="item" data-act="clone">⇣ 複製遠端儲存庫（clone）…</button>
+          <button class="item" data-act="addRepo">📁 加入本機儲存庫…</button>
+          <button class="item" data-act="initRepo">✚ 在資料夾建立新儲存庫（init）…</button>
+        </div>
+      </div>
+      <div class="menu-wrap">
+        <button class="ib" id="repoMenuBtn" title="儲存庫選項">⋯</button>
+        <div class="menu right" id="repoMenu" hidden>
+          <button class="item" data-act="revealRepo">在檔案管理員中顯示</button>
+          <button class="item" data-act="copyPath">複製路徑</button>
+          <button class="item" data-act="renameRepo">重新命名…</button>
+          <button class="item" data-act="identity">設定提交者名稱與 email…</button>
+          <div class="sep"></div>
+          <button class="item" data-act="removeRepo">從清單移除（不刪除檔案）</button>
+        </div>
+      </div>
+    </div>
+    <div id="sideTabs">
+      <button data-side="changes" class="on">變更 <span class="badge" id="chgCount" hidden>0</span></button>
+      <button data-side="branches">分支</button>
+      <button data-side="stash">儲藏 <span class="badge dim" id="stashCount" hidden>0</span></button>
+    </div>
+
+    <section id="changesPane" class="pane">
+      <div id="commitBox">
+        <textarea id="msg" rows="3" placeholder="提交訊息（⌘Enter 提交）" spellcheck="false"></textarea>
+        <div class="cbrow">
+          <button id="commitBtn" title="提交已暫存的變更">✓ 提交</button>
+          <label class="chk" title="把已暫存的變更併入上一次提交，並可修改訊息"><input type="checkbox" id="amend"> 修正上一次提交</label>
+        </div>
+      </div>
+      <div id="changes" class="list" tabindex="0"></div>
+    </section>
+
+    <section id="branchesPane" class="pane" hidden>
+      <div id="branches" class="list"></div>
+    </section>
+
+    <section id="stashPane" class="pane" hidden>
+      <div class="sbar">
+        <button class="secondary sm" data-act="stashPush">⤓ 儲藏目前的變更…</button>
+      </div>
+      <div id="stashes" class="list"></div>
+    </section>
+  </aside>
+  <div id="sideSplit" title="拖曳調整寬度"></div>
+
+  <main id="main">
+    <div id="toolbar">
+      <button class="tb" id="branchBtn" title="切換分支"><span class="ic">⎇</span><span id="brName">—</span><span id="brAb"></span></button>
+      <span class="sep"></span>
+      <button class="tb" data-act="fetch" title="從所有遠端擷取最新的提交，不改變你的檔案（fetch）"><span class="ic">⟳</span>擷取</button>
+      <button class="tb" data-act="pull" title="拉取遠端的提交並合併到目前分支（pull）"><span class="ic">↓</span>拉取<span class="cnt" id="pullCnt"></span></button>
+      <button class="tb" data-act="push" title="把本機的提交推送到遠端（push）"><span class="ic">↑</span>推送<span class="cnt" id="pushCnt"></span></button>
+      <span class="sep"></span>
+      <button class="tb" data-act="newBranch" title="從目前位置建立新分支"><span class="ic">＋</span>分支</button>
+      <button class="tb" data-act="mergeInto" title="把其他分支合併到目前分支"><span class="ic">⤞</span>合併</button>
+      <button class="tb" data-act="stashPush" title="把尚未提交的變更暫時收起來（stash）"><span class="ic">⤓</span>儲藏</button>
+      <span class="sp"></span>
+      <button class="tb" data-act="refresh" title="重新整理"><span class="ic">↻</span></button>
+      <button class="tb" id="outBtn" title="顯示執行過的 git 指令"><span class="ic">≡</span>輸出</button>
+    </div>
+    <div id="banner" hidden><span class="msg"></span><span class="acts"></span></div>
+    <div id="tabs"></div>
+    <div id="stage">
+      <div id="welcome" hidden>
+        <div class="hero">🌿</div>
+        <h2>Git 工具</h2>
+        <p>簡單的 Git 圖形介面：複製儲存庫、暫存與提交、推送與拉取，查看分支線圖，並一段一段解決合併衝突。</p>
+        <div class="acts">
+          <button data-act="clone">⇣ 複製遠端儲存庫…</button>
+          <button class="secondary" data-act="addRepo">📁 加入本機儲存庫…</button>
+          <button class="secondary" data-act="initRepo">✚ 建立新儲存庫…</button>
+        </div>
+        <p class="faint" id="gitVer"></p>
+      </div>
+    </div>
+    <div id="outPanel" hidden>
+      <div class="ohead"><b>輸出</b><span class="faint">最近執行的 git 指令</span><span class="sp"></span><button class="ib sm" data-act="clearOut" title="清除">⌫</button><button class="ib sm" data-act="closeOut" title="關閉">✕</button></div>
+      <div id="outList"></div>
+    </div>
+  </main>
+
+  <footer id="status">
+    <span id="stRepo" class="path"></span>
+    <span class="sp"></span>
+    <span id="stProgress" hidden><span class="spin"></span><span class="t"></span><button class="sb" id="cancelBtn">取消</button></span>
+    <span id="stNotice" class="notice"></span>
+  </footer>
+
+  <div id="ctxMenu" class="menu" hidden></div>
+
+  <div id="modal" hidden>
+    <form id="modalBox" autocomplete="off">
+      <div id="modalTitle"></div>
+      <div id="modalDesc"></div>
+      <div id="modalFields"></div>
+      <div id="modalHint"></div>
+      <div class="acts">
+        <button type="button" class="secondary" id="modalCancel">取消</button>
+        <button type="submit" id="modalOk">確定</button>
+      </div>
+    </form>
+  </div>
+
+  <script src="tooldock://sdk/ui-sdk.js"></script>
+  <script src="git-core.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

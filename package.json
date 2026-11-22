@@ -1,0 +1,110 @@
+{
+  "name": "git-tool",
+  "version": "1.0.0",
+  "description": "簡單的 Git 工具：複製、提交、推送、拉取、分支線圖與衝突解決",
+  "main": "backend/index.js",
+  "private": true,
+  "scripts": {
+    "dev": "tooldock-ext dev",
+    "debug": "tooldock-ext dev --inspect",
+    "validate": "tooldock-ext validate",
+    "test": "node --test test/*.test.js",
+    "pack": "tooldock-ext pack",
+    "install-local": "tooldock-ext install"
+  },
+  "tooldock": {
+    "id": "git-tool",
+    "displayName": "Git 工具",
+    "description": "簡單好上手的 Git 圖形介面：複製儲存庫、暫存與提交、推送、拉取、擷取；分支線圖與提交內容；切換、建立、合併分支；儲藏；逐段解決合併衝突",
+    "icon": "🌿",
+    "engine": "^1.4.0",
+    "activationEvents": [],
+    "contributes": {
+      "views": [
+        {
+          "id": "gitTool.main",
+          "title": "Git 工具",
+          "icon": "🌿",
+          "entry": "ui/index.html"
+        }
+      ],
+      "commands": [
+        {
+          "id": "gitTool.open",
+          "title": "Git 工具：開啟"
+        },
+        {
+          "id": "gitTool.clone",
+          "title": "Git 工具：複製儲存庫（clone）…"
+        },
+        {
+          "id": "gitTool.addRepo",
+          "title": "Git 工具：加入本機儲存庫…"
+        },
+        {
+          "id": "gitTool.pull",
+          "title": "Git 工具：拉取（pull）"
+        },
+        {
+          "id": "gitTool.push",
+          "title": "Git 工具：推送（push）"
+        },
+        {
+          "id": "gitTool.fetch",
+          "title": "Git 工具：擷取（fetch）"
+        }
+      ],
+      "configuration": {
+        "gitTool.gitPath": {
+          "type": "string",
+          "default": "",
+          "title": "git 執行檔",
+          "description": "留空時自動尋找"
+        },
+        "gitTool.pullMode": {
+          "type": "string",
+          "enum": [
+            "merge",
+            "rebase",
+            "ff-only"
+          ],
+          "default": "merge",
+          "title": "拉取方式",
+          "description": "merge：合併；rebase：重定基底；ff-only：只允許快轉"
+        },
+        "gitTool.logLimit": {
+          "type": "number",
+          "default": 300,
+          "title": "線圖顯示的提交數",
+          "description": "一次載入的數量，可以在線圖底部載入更多"
+        },
+        "gitTool.cloneDir": {
+          "type": "string",
+          "default": "",
+          "title": "複製的預設位置",
+          "description": "留空時為家目錄"
+        },
+        "gitTool.networkTimeout": {
+          "type": "number",
+          "default": 600,
+          "title": "網路操作逾時",
+          "description": "秒；clone、fetch、pull、push 超過時間會中止"
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tooldock-cli": "^1.3.1",
+    "tooldock-types": "^1.5.0"
+  },
+  "keywords": [
+    "tooldock",
+    "git",
+    "git-gui",
+    "clone",
+    "push",
+    "merge-conflict",
+    "branch-graph"
+  ]
+}
