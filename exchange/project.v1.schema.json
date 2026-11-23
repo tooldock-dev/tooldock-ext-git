@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "git-tool.project.v1",
+  "title": "專案（git-tool.project v1）",
+  "description": "在工具之間開啟同一個專案，或把專案分享給別人。同一台電腦內交付時帶 path；存成 .tdx 給別人時只帶 remotes 與 branch，接收端從檔案匯入時必須忽略 path。path 與 remotes 至少要有一個。網址不得包含帳號密碼。",
+  "type": "object",
+  "properties": {
+    "name": { "type": "string", "maxLength": 100, "description": "顯示名稱" },
+    "path": { "type": "string", "description": "專案資料夾的絕對路徑（只在同一台電腦內有意義）；可以是儲存庫中的子資料夾" },
+    "remotes": {
+      "type": "array",
+      "maxItems": 20,
+      "description": "遠端儲存庫，origin 排第一。只接受 https、http、ssh、git 與 scp 形式（git@host:path）的網址",
+      "items": {
+        "type": "object",
+        "required": ["name", "url"],
+        "properties": {
+          "name": { "type": "string", "maxLength": 100 },
+          "url": { "type": "string", "maxLength": 2048 }
+        }
+      }
+    },
+    "branch": { "type": "string", "maxLength": 255, "description": "分享時所在的分支；複製時預設切到這個分支" },
+    "file": { "type": "string", "maxLength": 1024, "description": "相對於 path 的檔案，以 / 分隔；接收端可以直接開啟它（需要 path）" },
+    "line": { "type": "integer", "minimum": 1, "description": "file 的行號，從 1 開始" }
+  },
+  "anyOf": [{ "required": ["path"] }, { "required": ["remotes"] }],
+  "examples": [
+    { "name": "tooldock-ext-git", "path": "/Users/me/code/tooldock-ext-git", "remotes": [{ "name": "origin", "url": "https://github.com/tooldock-dev/tooldock-ext-git.git" }], "branch": "main" },
+    { "name": "tooldock-ext-git", "remotes": [{ "name": "origin", "url": "git@github.com:tooldock-dev/tooldock-ext-git.git" }], "branch": "main" }
+  ]
+}

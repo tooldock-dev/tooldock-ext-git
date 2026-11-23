@@ -29,6 +29,7 @@ const st = {
   progress: null,
   diffMode: 'sbs',
   msgTouched: false,
+  targets: [], // 能接收 git-tool.project 的其他工具（程式碼編輯器等）
 };
 
 const repo = () => st.repos.find((r) => r.id === st.rid) || null;
@@ -61,13 +62,20 @@ function errInfo(err) {
   return m ? { code: m[1], message: m[2] } : { code: '', message: s.replace(/^Error: /, '') };
 }
 
-const AUTH_HELP = '登入方式：\n・HTTPS：在終端機對這個遠端執行一次 git fetch 或 git push，依提示登入（GitHub 可用 gh auth setup-git），之後系統的認證管理員會記住帳號。\n・SSH：用 ssh-keygen 產生金鑰、加入 ssh-agent，並把公鑰加到遠端帳號。';
+const AUTH_HELP = '登入方式：\n・HTTPS：在終端機對這個遠端執行一次 git fetch 或 git push，依提示登入（GitHub 可用 gh auth setup-git），之後系統的認證管理員會記住帳號。\n・SSH：在「＋」選單的「SSH 金鑰」產生金鑰，把公鑰加到遠端帳號，並把遠端改成 SSH 網址。';
 
 function fail(err) {
   const e = errInfo(err);
   notice(e.message, 'err');
   if (e.code === 'AUTH') {
     td.dialog.message({ type: 'warning', message: e.message, detail: AUTH_HELP, buttons: ['知道了'] }).catch(() => {});
+  } else if (e.code === 'SSH_KEY' || e.code === 'SSH_HOST') {
+    choose(e.message, ['開啟 SSH 金鑰…', '知道了'], { type: 'warning', detail: e.code === 'SSH_KEY'
+      ? '在「SSH 金鑰」可以產生金鑰、複製公鑰貼到網站，或為這個儲存庫指定要用哪一把金鑰（同一個網站有多個帳號時）。'
+      : '在「SSH 金鑰」測試一次連線，就會記住這台主機的金鑰（~/.ssh/known_hosts）。' })
+      .then((i) => { if (i === 0) return sshPanel(); return null; }).catch(fail);
+  } else if (e.code === 'SSH_HOST_CHANGED') {
+    td.dialog.message({ type: 'warning', message: e.message, detail: '確認是主機合法更換金鑰後，從 ~/.ssh/known_hosts 移除這台主機的舊紀錄（終端機：ssh-keygen -R <主機>），再重新連線。', buttons: ['知道了'] }).catch(() => {});
   } else if (e.code === 'NO_GIT') {
     td.dialog.message({ type: 'warning', message: e.message, detail: '請到 https://git-scm.com/downloads 下載安裝 Git；已安裝在其他位置時，到 ToolDock 的擴充設定填寫「git 執行檔」。', buttons: ['知道了'] }).catch(() => {});
   }
@@ -134,7 +142,7 @@ function form({ title, desc = '', fields, ok = '確定', validate, onInput }) {
         let input;
         if (f.type === 'select') input = `<select id="${id}">${f.options.map(([v, l]) => `<option value="${esc(v)}" ${v === f.value ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
         else if (f.type === 'textarea') input = `<textarea id="${id}" rows="${f.rows || 3}" placeholder="${esc(f.placeholder || '')}" spellcheck="false"></textarea>`;
-        else input = `<input type="text" id="${id}" placeholder="${esc(f.placeholder || '')}" spellcheck="false" autocomplete="off">`;
+        else input = `<input type="${f.type === 'password' ? 'password' : 'text'}" id="${id}" placeholder="${esc(f.placeholder || '')}" spellcheck="false" autocomplete="${f.type === 'password' ? 'new-password' : 'off'}">`;
         wrap.innerHTML = `<label for="${id}">${esc(f.label)}</label><div class="in">${input}${f.browse ? '<button type="button" class="secondary sm" data-browse>選擇…</button>' : ''}</div>${f.help ? `<div class="help">${esc(f.help)}</div>` : ''}`;
         const el = $(`#${id}`, wrap);
         if (f.type !== 'select') el.value = f.value || '';
@@ -304,17 +312,21 @@ async function initRepoFlow(dir) {
   notice(`已建立儲存庫「${res.repo.name}」`, 'ok');
 }
 
-async function cloneFlow() {
+/** preset：從分享的專案帶入 { url, name, branch, desc } */
+async function cloneFlow(preset = {}) {
   const d = await td.invoke('defaults');
-  let autoName = true;
+  const keys = (await td.invoke('ssh:keys').catch(() => [])).filter((k) => k.private);
+  let autoName = !preset.name;
   const v = await form({
     title: '複製遠端儲存庫（clone）',
-    desc: '把遠端的儲存庫完整下載到本機，之後就能提交、推送與拉取。',
+    desc: preset.desc || '把遠端的儲存庫完整下載到本機，之後就能提交、推送與拉取。',
     ok: '複製',
     fields: [
-      { name: 'url', label: '儲存庫網址', placeholder: 'https://github.com/使用者/專案.git 或 git@github.com:使用者/專案.git', help: '私人儲存庫需要先在系統中登入（HTTPS 的認證管理員或 SSH 金鑰）' },
+      { name: 'url', label: '儲存庫網址', value: preset.url || '', placeholder: 'https://github.com/使用者/專案.git 或 git@github.com:使用者/專案.git', help: '私人儲存庫需要先在系統中登入（HTTPS 的認證管理員或 SSH 金鑰）' },
       { name: 'parent', label: '放在哪個資料夾', value: store.get('cloneParent', d.cloneDir), browse: true },
-      { name: 'name', label: '資料夾名稱', placeholder: '依網址自動命名' },
+      { name: 'name', label: '資料夾名稱', value: preset.name || '', placeholder: '依網址自動命名' },
+      { name: 'branch', label: '分支（選填）', value: preset.branch || '', placeholder: '留空時使用遠端的預設分支' },
+      ...(keys.length > 1 ? [{ name: 'sshKey', label: 'SSH 金鑰（SSH 網址才會用到）', type: 'select', value: '', options: [['', '自動（ssh 預設的金鑰）'], ...keys.map((k) => [k.name, `${k.name}${k.comment ? `（${k.comment}）` : ''}`])], help: '同一個網站有多個帳號時，選擇這個儲存庫要用的金鑰；之後的推送、拉取也會使用它' }] : []),
     ],
     onInput: async (field, v, set) => {
       if (field === 'name') autoName = !v.name;
@@ -324,10 +336,278 @@ async function cloneFlow() {
   });
   if (!v) return;
   store.set('cloneParent', v.parent.trim());
-  const res = await td.invoke('clone', { url: v.url.trim(), parent: v.parent.trim(), name: v.name.trim() || undefined });
+  const res = await td.invoke('clone', { url: v.url.trim(), parent: v.parent.trim(), name: v.name.trim() || undefined, branch: v.branch.trim() || undefined, sshKey: v.sshKey || undefined });
   st.repos = res.repos;
   await selectRepo(res.repo.id);
   notice(`已複製到 ${res.repo.root}`, 'ok');
+}
+
+/* ───────────── SSH 金鑰：產生、取得公鑰、切換、測試連線 ───────────── */
+
+const ssh = { s: null, target: '', testKey: null, result: null, testing: false };
+const sshOpen = () => !$('#sshPanel').hidden;
+
+async function sshPanel() {
+  closeMenus();
+  ssh.s = await td.invoke('ssh:state', { id: st.rid });
+  ssh.result = null;
+  const r = ssh.s.remotes.find((x) => x.ssh);
+  ssh.target = r ? `${r.ssh.user}@${r.ssh.host}${r.ssh.port ? `:${r.ssh.port}` : ''}` : (ssh.target || 'git@github.com');
+  ssh.testKey = null; // null：依目前的設定
+  $('#sshPanel').hidden = false;
+  renderSsh();
+}
+
+function closeSsh() { $('#sshPanel').hidden = true; }
+
+async function reloadSsh() {
+  ssh.s = await td.invoke('ssh:state', { id: st.rid });
+  renderSsh();
+}
+
+/** 目前生效的金鑰名稱：儲存庫設定 > 全域設定 > ''（ssh 預設） */
+const effectiveKey = () => (ssh.s.local.value ? ssh.s.local.key || '' : ssh.s.global.value ? ssh.s.global.key || '' : '');
+const keyLabel = (k) => `${k.name}${k.comment ? `（${k.comment}）` : ''}`;
+const targetHost = () => (/^(?:[^@]+@)?([^:]+)/.exec(ssh.target.trim()) || [])[1] || '';
+
+function keySelect(scope, conf) {
+  const keys = ssh.s.keys.filter((k) => k.private);
+  const cur = conf.value ? (conf.custom && !conf.key ? '__custom' : conf.key || '__custom') : '';
+  const opts = [['', scope === 'local' ? '跟隨全域設定／ssh 預設' : '自動（ssh 預設的金鑰與 ~/.ssh/config）'], ...keys.map((k) => [k.name, keyLabel(k)])];
+  if (cur === '__custom' || (cur && !keys.some((k) => k.name === cur))) opts.push(['__custom', `自訂：${conf.value}`]);
+  return `<select data-ssh-scope="${scope}">${opts.map(([v, l]) => `<option value="${esc(v)}" ${v === cur ? 'selected' : ''} ${v === '__custom' ? 'disabled' : ''}>${esc(l)}</option>`).join('')}</select>`;
+}
+
+function renderSsh() {
+  const s = ssh.s;
+  const eff = effectiveKey();
+  const rows = s.keys.map((k) => {
+    const tags = [
+      `<span class="tag">${esc(k.label)}${k.bits ? ` ${k.bits}` : ''}</span>`,
+      s.repo && s.local.key === k.name ? '<span class="tag on">這個儲存庫使用</span>' : '',
+      s.global.key === k.name ? '<span class="tag on">全域預設</span>' : '',
+      !k.default && !k.configured ? '<span class="tag" title="不是 ssh 預設的檔名，也沒有寫在 ~/.ssh/config；需要在下方「使用哪一把金鑰」指定才會被使用">需要指定才會使用</span>' : '',
+      k.weak ? '<span class="tag warn" title="DSA 或小於 2048 位元的 RSA，多數網站已不接受">已過時</span>' : '',
+      !k.private ? '<span class="tag warn" title="只有公鑰，找不到對應的私鑰檔">沒有私鑰</span>' : '',
+    ].join('');
+    return `<div class="krow" data-key="${esc(k.name)}"><div class="kmain"><span class="kname">${esc(k.name)}</span>${tags}`
+      + `<div class="kmeta" title="${esc(k.file)}">${esc(k.comment || '（沒有註解）')} · ${esc(k.fingerprint)}</div></div>`
+      + `<div class="kacts"><button class="sm" data-ssh="copy">複製公鑰</button><button class="ib sm" data-ssh="keyMenu" title="更多">⋯</button></div></div>`;
+  }).join('');
+  const host = targetHost();
+  const pages = Object.entries(s.pages);
+  const httpsRemotes = s.remotes.filter((r) => r.sshUrl);
+  const testOpts = [['__eff', `目前的設定（${eff || 'ssh 預設'}）`], ['', 'ssh 預設的金鑰'], ...s.keys.filter((k) => k.private).map((k) => [k.name, keyLabel(k)])];
+  const tk = ssh.testKey === null ? '__eff' : ssh.testKey;
+  const res = ssh.testing ? '<div class="sshResult">連線中…</div>'
+    : ssh.result ? `<div class="sshResult ${ssh.result.ok ? 'ok' : 'err'}">${ssh.result.ok ? '✓ ' : '✗ '}${esc(ssh.result.message)}${ssh.result.hostAdded ? '\n已記住這台主機的金鑰（~/.ssh/known_hosts）。' : ''}</div>` : '';
+  $('#sshBody').innerHTML = `
+    <p class="desc">遠端使用 SSH 網址（例如 git@github.com:使用者/專案.git）時，git 用這台電腦的金鑰登入。把<b>公鑰</b>加到網站的帳號後就能推送與拉取；私鑰只留在這台電腦，不要給任何人。</p>
+    <h4>這台電腦的金鑰<span class="dim">${esc(s.dir)}</span></h4>
+    ${s.keys.length ? `<div class="keys">${rows}</div>` : '<div class="empty-msg">還沒有 SSH 金鑰。按「產生新金鑰」建立一把。</div>'}
+    <div class="row2" style="margin-top:8px"><button class="sm" data-ssh="generate">＋ 產生新金鑰…</button><button class="secondary sm" data-ssh="reveal">開啟 ~/.ssh 資料夾</button><button class="secondary sm" data-ssh="reload">↻</button></div>
+
+    <h4>加到網站</h4>
+    <div class="row2">複製公鑰後，貼到網站的「新增 SSH 金鑰」頁面：${pages.map(([h, p]) => `<button class="secondary sm" data-ssh="page" data-host="${esc(h)}">${esc(p.title)} ↗</button>`).join('')}</div>
+
+    <h4>使用哪一把金鑰</h4>
+    ${s.repo ? `<div class="row2"><label>這個儲存庫（${esc(s.repo.name)}）</label>${keySelect('local', s.local)}</div>` : ''}
+    <div class="row2"><label>所有儲存庫（全域預設）</label>${keySelect('global', s.global)}</div>
+    <div class="hint">同一個網站有多個帳號（例如公司與個人的 GitHub）時，為每個儲存庫指定金鑰。指定後只會用那一把，不會再嘗試其他金鑰。設定寫在 git 的 core.sshCommand。</div>
+
+    <h4>測試連線</h4>
+    <div class="row2"><input id="sshTarget" value="${esc(ssh.target)}" placeholder="git@github.com" spellcheck="false"><select id="sshTestKey">${testOpts.map(([v, l]) => `<option value="${esc(v)}" ${v === tk ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select><button class="sm" data-ssh="test" ${ssh.testing ? 'disabled' : ''}>測試</button></div>
+    ${res}
+    <div class="hint">第一次連線到一台主機時會記住它的金鑰（~/.ssh/known_hosts）；之後主機金鑰改變時會拒絕連線。</div>
+    ${httpsRemotes.length ? `<h4>這個儲存庫的遠端</h4>${httpsRemotes.map((r) => `<div class="row2"><span>${esc(r.name)} 使用 HTTPS（${esc(r.url)}），不會用到 SSH 金鑰。</span><button class="secondary sm" data-ssh="toSsh" data-remote="${esc(r.name)}">改用 SSH 網址</button></div>`).join('')}` : ''}
+  `;
+  if (host && s.pages[host]) $(`[data-ssh="page"][data-host="${host}"]`).classList.remove('secondary');
+}
+
+async function sshCopy(name) {
+  const k = await td.invoke('ssh:publicKey', name);
+  await copyText(k.text);
+  notice(`已複製 ${name}.pub 的公鑰，貼到網站的「新增 SSH 金鑰」頁面`, 'ok');
+  return k;
+}
+
+async function sshUse(scope, key) {
+  const conf = scope === 'local' ? ssh.s.local : ssh.s.global;
+  if (conf.custom && conf.value && !await confirmBox(`${scope === 'local' ? '這個儲存庫' : '全域'}已經有自訂的 SSH 指令，要取代它嗎？`, '取代', { detail: conf.value })) { renderSsh(); return; }
+  ssh.s = await td.invoke('ssh:use', { id: st.rid, scope, key });
+  ssh.testKey = null;
+  renderSsh();
+  notice(key ? `${scope === 'local' ? '這個儲存庫' : '所有儲存庫'}改用 ${key}` : (scope === 'local' ? '這個儲存庫改為跟隨全域設定' : '全域改回 ssh 預設的金鑰'), 'ok');
+}
+
+async function sshGenerate() {
+  const s = ssh.s;
+  let touched = false;
+  const v = await form({
+    title: '產生新的 SSH 金鑰',
+    desc: '金鑰存在 ~/.ssh，不會覆蓋現有的檔案。產生後公鑰會自動複製，貼到網站的「新增 SSH 金鑰」頁面即可。',
+    ok: '產生',
+    fields: [
+      { name: 'type', label: '類型', type: 'select', value: 'ed25519', options: [['ed25519', 'Ed25519（建議）'], ['rsa', 'RSA 4096（給不支援 Ed25519 的舊伺服器）']] },
+      { name: 'name', label: '檔名', value: s.suggest.ed25519, help: s.keys.length ? '不是 id_ed25519、id_rsa 這類預設檔名時，要在「使用哪一把金鑰」指定給儲存庫才會被使用' : '' },
+      { name: 'comment', label: '註解（通常填 email，方便在網站上辨識）', value: s.email || '' },
+      { name: 'pass', label: '密碼（選填）', type: 'password', placeholder: '留空不設密碼', help: '設了密碼的金鑰，要先在終端機用 ssh-add 加入 ssh-agent，這裡的推送、拉取才能使用' },
+    ],
+    onInput: (field, val, set) => {
+      if (field === 'name') touched = true;
+      if (field === 'type' && !touched) set('name', s.suggest[val.type]);
+    },
+    validate: (val) => (!/^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$/.test(val.name.trim()) || /\.pub$/i.test(val.name.trim()) ? '檔名只能有英數與 . _ -，而且不能以 .pub 結尾'
+      : val.pass && val.pass.length < 5 ? '密碼至少要 5 個字元（或留空）' : ''),
+  });
+  if (!v) return;
+  const r = await td.invoke('ssh:generate', { name: v.name.trim(), type: v.type, comment: v.comment.trim(), passphrase: v.pass });
+  await copyText(r.text);
+  await reloadSsh();
+  const k = ssh.s.keys.find((x) => x.name === r.name);
+  const host = targetHost();
+  const page = ssh.s.pages[host] || ssh.s.pages['github.com'];
+  const notes = [`指紋：${r.fingerprint}`, '公鑰已複製到剪貼簿，貼到網站的「新增 SSH 金鑰」頁面後，按「測試連線」確認。'];
+  if (k && !k.default && !k.configured) notes.push(`${r.name} 不是 ssh 預設的檔名，請在「使用哪一把金鑰」把它指定給儲存庫。`);
+  if (r.hasPassphrase) notes.push(`這把金鑰有密碼，請先在終端機加入 ssh-agent：\nssh-add ${IS_MAC ? '--apple-use-keychain ' : ''}~/.ssh/${r.name}`);
+  const i = await choose(`已產生金鑰 ${r.name}`, [`開啟 ${page.title} 新增頁`, '關閉'], { type: 'info', detail: notes.join('\n\n'), cancel: 1 });
+  if (i === 0) await td.shell.openExternal(page.url);
+}
+
+async function sshTest() {
+  ssh.target = $('#sshTarget').value.trim();
+  const m = /^(?:([A-Za-z0-9._-]+)@)?([A-Za-z0-9.-]+)(?::(\d+))?$/.exec(ssh.target);
+  if (!m) { notice('請輸入「使用者@主機」，例如 git@github.com', 'err'); return; }
+  const sel = $('#sshTestKey').value;
+  ssh.testKey = sel === '__eff' ? null : sel;
+  const key = sel === '__eff' ? effectiveKey() : sel;
+  ssh.testing = true;
+  ssh.result = null;
+  renderSsh();
+  try {
+    ssh.result = await td.invoke('ssh:test', { user: m[1] || 'git', host: m[2], port: m[3] ? Number(m[3]) : null, key });
+  } catch (err) {
+    ssh.result = { ok: false, message: errInfo(err).message };
+  } finally {
+    ssh.testing = false;
+    if (sshOpen()) renderSsh();
+  }
+}
+
+async function sshToSsh(name) {
+  const r = ssh.s.remotes.find((x) => x.name === name);
+  if (!r || !r.sshUrl) return;
+  if (!await confirmBox(`把遠端 ${name} 改成 SSH 網址？`, '變更', { detail: `${r.url}\n→ ${r.sshUrl}\n\n之後推送、拉取會用 SSH 金鑰登入。要改回來時，在分支面板的遠端清單移除後重新新增即可。` })) return;
+  await api('setRemoteUrl', { name, url: r.sshUrl });
+  await reloadSsh();
+  ssh.target = `git@${(/^git@([^:]+):/.exec(r.sshUrl) || [])[1] || 'github.com'}`;
+  renderSsh();
+  notice(`${name} 已改用 ${r.sshUrl}`, 'ok');
+}
+
+function initSsh() {
+  const box = $('#sshBody');
+  $('#sshPanel').addEventListener('mousedown', (e) => { if (e.target.id === 'sshPanel') closeSsh(); });
+  $('[data-ssh="close"]').onclick = closeSsh;
+  box.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-ssh]');
+    if (!b) return;
+    const act = b.dataset.ssh;
+    const key = b.closest('.krow') && b.closest('.krow').dataset.key;
+    const run = {
+      copy: () => sshCopy(key),
+      keyMenu: () => {
+        const k = ssh.s.keys.find((x) => x.name === key);
+        menuBelow(b, [
+          ['複製公鑰', () => sshCopy(key)],
+          '-',
+          ...(ssh.s.repo ? [['設為這個儲存庫使用', () => sshUse('local', key), { disabled: !k.private }]] : []),
+          ['設為所有儲存庫的預設', () => sshUse('global', key), { disabled: !k.private }],
+          ['用這把金鑰測試連線', () => { ssh.testKey = key; renderSsh(); return sshTest(); }, { disabled: !k.private }],
+          '-',
+          ['在檔案管理員中顯示', () => td.shell.showItemInFolder(k.file)],
+        ]);
+      },
+      generate: sshGenerate,
+      reveal: () => td.invoke('ssh:reveal'),
+      reload: reloadSsh,
+      page: () => td.shell.openExternal(ssh.s.pages[b.dataset.host].url),
+      test: sshTest,
+      toSsh: () => sshToSsh(b.dataset.remote),
+    }[act];
+    if (run) Promise.resolve(run()).catch(fail);
+  });
+  box.addEventListener('change', (e) => {
+    const sel = e.target.closest('[data-ssh-scope]');
+    if (sel) sshUse(sel.dataset.sshScope, sel.value).catch((err) => { renderSsh(); fail(err); });
+  });
+  box.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.id === 'sshTarget') { e.preventDefault(); sshTest().catch(fail); } });
+}
+
+/* ───────────── 專案交換：在其他工具開啟、分享給別人 ───────────── */
+
+/** 重新查詢能接收專案的工具，更新選單文字 */
+async function refreshTargets() {
+  try {
+    st.targets = td.exchange ? await td.exchange.receivers('git-tool.project') : [];
+  } catch { st.targets = []; }
+  const item = $('#openInItem');
+  item.hidden = !st.targets.length;
+  item.textContent = targetLabel();
+}
+const targetLabel = () => (st.targets.length === 1 ? st.targets[0].title || `在${st.targets[0].name}開啟` : '在其他工具開啟…');
+
+async function openInFlow(opts = {}) {
+  const r = await api('openIn', opts);
+  if (r.status === 'cancelled') return;
+  if (r.status === 'exported') return;
+  notice(r.message || (r.receiver ? `已交給${r.receiver.name}` : '已開啟'), 'ok');
+}
+
+async function shareFileFlow() {
+  let r;
+  try {
+    r = await api('shareFile');
+  } catch (err) {
+    if (errInfo(err).code === 'NO_REMOTE') {
+      if (await confirmBox('這個儲存庫還沒有設定網路上的遠端', '新增遠端…', { detail: '分享的交換檔只包含遠端網址與分支，對方要從遠端（例如 GitHub）複製。請先新增遠端並推送。' })) await addRemoteFlow();
+      return;
+    }
+    throw err;
+  }
+  if (!r) return;
+  const i = await choose(`已存成 ${basename(r.filePath)}`, ['在檔案管理員中顯示', '關閉'], {
+    type: 'info',
+    detail: `把這個檔案傳給對方，對方在 ToolDock 開啟（或拖到視窗上）後，就能用 Git 工具複製這個專案。\n\n遠端：${r.remote}${r.branch ? `\n分支：${r.branch}` : ''}\n\n檔案不含你的帳號密碼與本機路徑。私人儲存庫需要對方有存取權限。`,
+  });
+  if (i === 0) await td.shell.showItemInFolder(r.filePath);
+}
+
+/** 收到分享的專案（只有遠端）：清單中已有相同遠端時詢問，否則開啟帶好網址的複製對話框 */
+async function cloneProjectFlow({ project, existing = [], origin }) {
+  if (existing.length) {
+    const e = existing[0];
+    const i = await choose(`清單中已經有「${e.name}」，和收到的專案是同一個遠端`, ['開啟現有的儲存庫', '另外複製一份', '取消'], { detail: e.root });
+    if (i === 0) { st.repos = await td.invoke('repos'); await selectRepo(e.id); return; }
+    if (i !== 1) return;
+  }
+  const remote = project.remotes[0];
+  await cloneFlow({
+    url: remote.url,
+    name: '',
+    branch: project.branch || '',
+    desc: `${origin === 'file' ? '從交換檔' : '從其他工具'}收到專案「${project.name}」。請確認網址是你信任的來源，按「複製」後才會開始下載。`,
+  });
+}
+
+async function importCommand(c) {
+  if (c.command === 'openRepo') {
+    st.repos = await td.invoke('repos');
+    if (st.rid !== c.id) await selectRepo(c.id); else renderRepoSel();
+    return;
+  }
+  if (c.command === 'addRepo') return addRepoFlow(c.dir);
+  if (c.command === 'cloneProject') return cloneProjectFlow(c);
 }
 
 async function removeRepoFlow() {
@@ -589,6 +869,7 @@ function initChanges() {
     if (area === 'staged') items.push(['取消暫存', () => onChangeAction('unstage', area, p)]);
     items.push('-');
     if (e && e.status !== 'D') items.push(['開啟檔案', () => api('openFile', { path: p })]);
+    if (e && e.status !== 'D' && st.targets.length) items.push([targetLabel(), () => openInFlow({ file: p })]);
     items.push(['複製相對路徑', () => copyText(p)]);
     if (area === 'unstaged') items.push('-', ['捨棄變更…', () => onChangeAction('discard', area, p), { danger: true }]);
     if (area === 'untracked') items.push('-', ['刪除檔案…', () => onChangeAction('discard', area, p), { danger: true }]);
@@ -1901,6 +2182,8 @@ function initSplit() {
 /* ───────────── 指令 ───────────── */
 
 async function runCommand(command) {
+  if (command && typeof command === 'object') return importCommand(command);
+  if (command === 'sshKeys') return sshPanel();
   if (command === 'clone') return cloneFlow();
   if (command === 'addRepo') return addRepoFlow();
   if (!st.rid) { notice('請先選擇或加入儲存庫', 'err'); return; }
@@ -1910,8 +2193,11 @@ async function runCommand(command) {
 }
 
 const ACTIONS = {
-  clone: cloneFlow,
+  clone: () => cloneFlow(),
   addRepo: () => addRepoFlow(),
+  openIn: () => openInFlow(),
+  shareFile: shareFileFlow,
+  sshKeys: () => sshPanel(),
   initRepo: () => initRepoFlow(),
   removeRepo: removeRepoFlow,
   renameRepo: renameRepoFlow,
@@ -1939,6 +2225,7 @@ async function init() {
   initBranches();
   initStashes();
   initTabs();
+  initSsh();
 
   // 線圖分頁固定在第一個
   const g = { kind: 'graph', fixed: true, title: '⑂ 線圖', tip: '分支線圖與提交歷史' };
@@ -1946,7 +2233,7 @@ async function init() {
   addTab(g);
 
   document.addEventListener('click', (e) => {
-    if (!e.target.closest('.menu') && !e.target.closest('.menu-wrap > button') && !e.target.closest('#branchBtn') && !e.target.closest('[data-act="mergeInto"]')) closeMenus();
+    if (!e.target.closest('.menu') && !e.target.closest('.menu-wrap > button') && !e.target.closest('#branchBtn') && !e.target.closest('[data-act="mergeInto"]') && !e.target.closest('[data-ssh="keyMenu"]')) closeMenus();
     const a = e.target.closest('[data-act]');
     if (a && !a.closest('.view') && !a.closest('#modal') && ACTIONS[a.dataset.act]) {
       closeMenus();
@@ -1954,7 +2241,13 @@ async function init() {
     }
   });
   $('#addBtn').onclick = () => { const m = $('#addMenu'); const open = m.hidden; closeMenus(); m.hidden = !open; };
-  $('#repoMenuBtn').onclick = () => { const m = $('#repoMenu'); const open = m.hidden; closeMenus(); m.hidden = !open || !repo(); };
+  $('#repoMenuBtn').onclick = () => {
+    const m = $('#repoMenu');
+    const open = m.hidden;
+    closeMenus();
+    m.hidden = !open || !repo();
+    if (!m.hidden) refreshTargets();
+  };
   $('#branchBtn').onclick = (e) => branchMenu(e.currentTarget).catch(fail);
   $('#outBtn').onclick = () => toggleOutput().catch(fail);
   $('#cancelBtn').onclick = () => td.invoke('cancel').catch(fail);
@@ -1967,7 +2260,10 @@ async function init() {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); commitFlow().catch(fail); }
   });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeMenus();
+    if (e.key === 'Escape') {
+      if (sshOpen() && $('#modal').hidden && $$('.menu').every((m) => m.hidden)) { closeSsh(); return; }
+      closeMenus();
+    }
     const mod = IS_MAC ? e.metaKey : e.ctrlKey;
     if (mod && e.key.toLowerCase() === 'w' && st.active) {
       const t = st.tabs.find((x) => x.id === st.active);
@@ -2013,6 +2309,7 @@ async function init() {
   if (st.info.busy) { st.busy = st.info.busy; renderProgress(); }
   const last = st.repos.find((r) => r.id === st.info.lastRepo) ? st.info.lastRepo : (st.repos[0] && st.repos[0].id);
   await selectRepo(last || null);
+  refreshTargets();
   const pending = await td.invoke('takePending');
   if (pending) await runCommand(pending);
 }

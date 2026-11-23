@@ -22,6 +22,14 @@ async function topLevel(git, dir) {
   }
 }
 
+/** 分享專案用的摘要：遠端與目前分支（不跑 status，大型儲存庫也很快） */
+async function describe(git, top) {
+  const remotes = G.parseRemotes(await git.text(['remote', '-v'], top, { quiet: true }));
+  let branch = '';
+  try { branch = (await git.text(['symbolic-ref', '--short', '-q', 'HEAD'], top, { quiet: true })).trim(); } catch { /* 分離的 HEAD */ }
+  return { remotes, branch };
+}
+
 async function gitDir(git, top) {
   return path.resolve(top, (await git.text(['rev-parse', '--git-dir'], top, { quiet: true })).trim());
 }
@@ -243,6 +251,28 @@ async function setIdentity(git, top, { name, email, global = true }) {
   const scope = global ? ['--global'] : [];
   await git(['config', ...scope, 'user.name', n], top);
   await git(['config', ...scope, 'user.email', e], top);
+}
+
+/* ───────────── SSH 金鑰（core.sshCommand） ───────────── */
+
+/** 儲存庫與全域的 core.sshCommand；top 為 null 時只讀全域 */
+async function sshCommands(git, top) {
+  const get = async (scope, cwd) => {
+    try { return (await git.text(['config', scope, '--get', 'core.sshCommand'], cwd, { quiet: true })).trim(); } catch { return ''; }
+  };
+  return { local: top ? await get('--local', top) : '', global: await get('--global', top || undefined) };
+}
+
+/** 設定（value）或移除（value 為空）core.sshCommand；scope：local（這個儲存庫）或 global */
+async function setSshCommand(git, top, { scope, value }) {
+  if (scope !== 'local' && scope !== 'global') throw new Error('scope 不正確');
+  if (scope === 'local' && !top) throw new Error('請先選擇儲存庫');
+  const v = String(value || '').trim();
+  // eslint-disable-next-line no-control-regex
+  if (/[\0-\x1f]/.test(v)) throw new Error('指令不能換行');
+  const cwd = top || undefined;
+  if (v) { await git(['config', `--${scope}`, 'core.sshCommand', v], cwd); return; }
+  try { await git(['config', `--${scope}`, '--unset-all', 'core.sshCommand'], cwd, { quiet: true }); } catch { /* 本來就沒有設定 */ }
 }
 
 /* ───────────── 分支 ───────────── */
@@ -479,6 +509,11 @@ async function addRemote(git, top, { name, url }) {
   await git(['remote', 'add', n, checkUrl(url)], top);
 }
 
+async function setRemoteUrl(git, top, { name, url }) {
+  safeRef(name, '遠端名稱');
+  await git(['remote', 'set-url', name, checkUrl(url)], top);
+}
+
 async function removeRemote(git, top, { name }) {
   safeRef(name, '遠端名稱');
   await git(['remote', 'remove', name], top);
@@ -491,8 +526,11 @@ function repoNameFromUrl(url) {
   return name.replace(/[<>:"|?*]/g, '').trim();
 }
 
-async function clone(git, { url, parent, name }, net) {
+/** sshCommand：指定金鑰時的 core.sshCommand，複製時使用並寫入新儲存庫的設定 */
+async function clone(git, { url, parent, name, branch, sshCommand }, net) {
   const u = checkUrl(url);
+  const b = String(branch || '').trim();
+  if (b) safeRef(b, '分支名稱');
   if (typeof parent !== 'string' || !path.isAbsolute(parent)) throw new Error('請選擇要放在哪個資料夾');
   if (!fs.existsSync(parent)) throw new Error(`資料夾不存在：${parent}`);
   const n = String(name || repoNameFromUrl(u)).trim();
@@ -500,7 +538,10 @@ async function clone(git, { url, parent, name }, net) {
   const dest = path.join(parent, n);
   if (fs.existsSync(dest) && fs.readdirSync(dest).length) throw new Error(`${dest} 已經存在而且不是空的`);
   // 取消或失敗時 git 會自己清掉它建立的資料夾
-  await git(['clone', '--progress', '--', u, n], parent, net);
+  const ssh = String(sshCommand || '').trim();
+  // eslint-disable-next-line no-control-regex
+  if (/[\0-\x1f]/.test(ssh)) throw new Error('SSH 指令不正確');
+  await git(['clone', '--progress', ...(ssh ? ['-c', `core.sshCommand=${ssh}`] : []), ...(b ? ['--branch', b] : []), '--', u, n], parent, net);
   return dest;
 }
 
@@ -608,11 +649,11 @@ async function markResolved(git, top, { path: p, remove = false }) {
 }
 
 module.exports = {
-  topLevel, gitDir, opState, status, diffSides, log, commitInfo, commitDiff,
-  stage, unstage, stageAll, unstageAll, discard, commit, identity, setIdentity,
+  topLevel, describe, gitDir, opState, status, diffSides, log, commitInfo, commitDiff,
+  stage, unstage, stageAll, unstageAll, discard, commit, identity, setIdentity, sshCommands, setSshCommand,
   branches, checkout, createBranch, deleteBranch, renameBranch, deleteRemoteBranch, createTag, deleteTag,
   merge, cherryPick, revert, reset, abortOp, continueOp,
-  fetchAll, pull, push, addRemote, removeRemote, clone, init, repoNameFromUrl, checkUrl,
+  fetchAll, pull, push, addRemote, removeRemote, setRemoteUrl, clone, init, repoNameFromUrl, checkUrl,
   stashes, stashPush, stashApply, stashDrop, stashFiles,
   conflictInfo, resolveText, takeSide, markResolved,
 };

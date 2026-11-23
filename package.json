@@ -1,6 +1,6 @@
 {
   "name": "git-tool",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "簡單的 Git 工具：複製、提交、推送、拉取、分支線圖與衝突解決",
   "main": "backend/index.js",
   "private": true,
@@ -15,7 +15,7 @@
   "tooldock": {
     "id": "git-tool",
     "displayName": "Git 工具",
-    "description": "簡單好上手的 Git 圖形介面：複製儲存庫、暫存與提交、推送、拉取、擷取；分支線圖與提交內容；切換、建立、合併分支；儲藏；逐段解決合併衝突",
+    "description": "簡單好上手的 Git 圖形介面：複製儲存庫、暫存與提交、推送、拉取、擷取；分支線圖與提交內容；切換、建立、合併分支；儲藏；逐段解決合併衝突；產生、複製與切換 SSH 金鑰；可以在程式碼編輯器等其他工具開啟同一個專案，或把專案存成交換檔分享給別人",
     "icon": "🌿",
     "engine": "^1.6.0",
     "activationEvents": [],
@@ -54,6 +54,10 @@
         {
           "id": "gitTool.fetch",
           "title": "Git 工具：擷取（fetch）"
+        },
+        {
+          "id": "gitTool.sshKeys",
+          "title": "Git 工具：SSH 金鑰…"
         }
       ],
       "configuration": {
@@ -92,6 +96,24 @@
           "title": "網路操作逾時",
           "description": "秒；clone、fetch、pull、push 超過時間會中止"
         }
+      },
+      "exchange": {
+        "formats": [
+          {
+            "type": "git-tool.project",
+            "version": 1,
+            "title": "專案",
+            "schema": "exchange/project.v1.schema.json"
+          }
+        ],
+        "imports": [
+          {
+            "type": "git-tool.project",
+            "handler": "importProject",
+            "title": "在 Git 工具開啟",
+            "view": "gitTool.main"
+          }
+        ]
       }
     }
   },
@@ -107,6 +129,7 @@
     "clone",
     "push",
     "merge-conflict",
-    "branch-graph"
+    "branch-graph",
+    "ssh-key"
   ]
 }

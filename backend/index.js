@@ -12,10 +12,12 @@ const path = require('path');
 const crypto = require('crypto');
 const G = require('./git');
 const ops = require('./ops');
+const P = require('./project');
+const S = require('./ssh');
 
 let ctx = null;
 let git = null;
-let pendingCommand = null;
+let pendingCommand = null; // 畫面還沒開時收到的指令：字串，或匯入專案時的物件 { command, ... }
 let queue = Promise.resolve();
 let running = null; // { id, title, cancel }
 let watcher = null;
@@ -84,6 +86,149 @@ function removeRepo(id) {
   if (ctx.storage.get('lastRepo') === id) ctx.storage.set('lastRepo', next[0] ? next[0].id : null);
   if (watcher && watcher.id === id) unwatch();
   return next;
+}
+
+/* ───────────── 專案交換（git-tool.project） ───────────── */
+
+/** 把指令交給畫面；畫面還沒載入完成時，啟動後由 takePending 取得 */
+function toUi(command) {
+  pendingCommand = command;
+  ctx.ui.emit('command', { command });
+}
+
+/** 儲存庫的 git-tool.project payload；forFile 時不帶本機路徑（給別人） */
+async function projectPayload(id, { forFile = false, file, line } = {}) {
+  const r = repo(id);
+  const d = await ops.describe(git, r.root);
+  return P.buildPayload({ name: r.name, root: r.root, remotes: d.remotes, branch: d.branch, file, line }, { forFile });
+}
+
+/** 清單中遠端網址相同的儲存庫 */
+async function reposWithRemote(remotes) {
+  const out = [];
+  for (const r of repos()) {
+    if (!fs.existsSync(r.root)) continue;
+    try {
+      const d = await ops.describe(git, r.root);
+      if (d.remotes.some((x) => remotes.some((y) => P.sameRemote(x.url, y.url)))) out.push({ id: r.id, name: r.name, root: r.root });
+    } catch { /* 無法讀取的儲存庫略過 */ }
+  }
+  return out;
+}
+
+/** 交給其他工具開啟（例如程式碼編輯器）；沒有接收端時不另存檔案 */
+async function openIn(id, { file, line, receiver } = {}) {
+  if (!ctx.exchange) throw new Error('需要 ToolDock 1.4.0 以上才能在其他工具開啟');
+  const payload = await projectPayload(id, { file, line });
+  const pkg = ctx.exchange.create(P.TYPE, payload, { title: file ? `${payload.name}：${file}` : payload.name, description: payload.path });
+  const res = await ctx.exchange.share(pkg, { fallback: 'none', ...(receiver ? { preferReceiver: receiver } : {}) });
+  if (res.status === 'no-receiver') throw new Error('沒有可以開啟專案的工具，可以到擴充商店安裝「程式碼編輯器」');
+  if (res.status === 'error') throw new Error(res.message || '無法交給其他工具');
+  if (res.status === 'delivered' && res.result && res.result.status === 'rejected') throw new Error(res.result.message || '對方無法開啟這個專案');
+  return { status: res.status, receiver: res.receiver || null, message: res.result && res.result.message };
+}
+
+/** 存成 .tdx 交換檔給別人：只帶遠端網址與分支 */
+async function shareFile(id) {
+  if (!ctx.exchange) throw new Error('需要 ToolDock 1.4.0 以上才能分享專案');
+  const payload = await projectPayload(id, { forFile: true });
+  const pkg = ctx.exchange.create(P.TYPE, payload, {
+    title: payload.name,
+    description: `${payload.remotes[0].url}${payload.branch ? `（${payload.branch} 分支）` : ''}`,
+  });
+  // eslint-disable-next-line no-control-regex
+  const safe = payload.name.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').trim() || 'project';
+  const r = await ctx.window.showSaveDialog({ title: '分享專案：存成交換檔', defaultPath: path.join(os.homedir(), `${safe}.tdx`), filters: [{ name: 'ToolDock 交換檔', extensions: ['tdx'] }] });
+  if (!r || r.canceled || !r.filePath) return null;
+  const file = /\.tdx$/i.test(r.filePath) ? r.filePath : `${r.filePath}.tdx`;
+  fs.writeFileSync(file, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+  ctx.log.info(`分享專案「${payload.name}」：${file}`);
+  return { filePath: file, remote: payload.remotes[0].url, branch: payload.branch || '' };
+}
+
+/**
+ * 接收 git-tool.project：
+ * - 帶本機路徑（同一台電腦的其他工具）：加入清單並選取；不是儲存庫時由畫面詢問是否建立。
+ * - 從 .tdx 檔或路徑不存在：由畫面開啟帶好網址的複製對話框，使用者確認後才下載。
+ */
+async function importProject(pkg, info = {}) {
+  const res = await importProjectInner(pkg, info);
+  // 平台不會顯示接收端的拒絕原因，自己告訴使用者
+  if (res.status === 'rejected') ctx.window.toast(res.message, 'warn').catch(() => {});
+  return res;
+}
+
+async function importProjectInner(pkg, info) {
+  let p;
+  try {
+    p = P.parsePayload(pkg && pkg.payload, { origin: info.origin });
+  } catch (err) {
+    return { status: 'rejected', message: err.message };
+  }
+  const from = info.producer ? `（來自 ${info.producer.name}）` : '';
+  if (p.path && fs.existsSync(p.path)) {
+    let top;
+    try { top = await ops.topLevel(git, p.path); } catch (err) { return { status: 'rejected', message: err.message }; }
+    if (!top) {
+      toUi({ command: 'addRepo', dir: p.path });
+      return { status: 'imported', message: `「${p.name}」還不是 Git 儲存庫，已在 Git 工具詢問是否建立` };
+    }
+    const res = await addRepo(top, top === p.path ? p.name : '');
+    ctx.storage.set('lastRepo', res.repo.id);
+    toUi({ command: 'openRepo', id: res.repo.id });
+    ctx.log.info(`開啟專案「${res.repo.name}」${from}：${res.repo.root}`);
+    return { status: 'imported', message: `已在 Git 工具開啟「${res.repo.name}」`, data: { repoId: res.repo.id, root: res.repo.root, added: !res.existed } };
+  }
+  if (!p.remotes.length) return { status: 'rejected', message: `資料夾不存在：${p.path}` };
+  const existing = await reposWithRemote(p.remotes);
+  toUi({ command: 'cloneProject', project: { name: p.name, remotes: p.remotes, branch: p.branch }, existing, origin: info.origin === 'file' ? 'file' : 'share' });
+  ctx.log.info(`收到專案「${p.name}」${from}：${p.remotes[0].url}`);
+  return { status: 'imported', message: existing.length ? `已在 Git 工具開啟「${existing[0].name}」的選項` : `已在 Git 工具開啟複製畫面，確認後才會下載「${p.name}」` };
+}
+
+/* ───────────── SSH 金鑰 ───────────── */
+
+/** core.sshCommand 的值 → { value, key（~/.ssh 中的金鑰名稱）, keyFile, custom } */
+function describeSshCommand(value) {
+  const r = S.parseSshCommand(value);
+  const dir = S.sshDir();
+  const key = r.keyFile && path.dirname(path.resolve(r.keyFile)) === path.resolve(dir) ? path.basename(r.keyFile) : null;
+  return { value: value || '', key, keyFile: r.keyFile, custom: r.custom };
+}
+
+/** SSH 面板需要的全部資料；id 可省略（還沒有選儲存庫時） */
+async function sshState(id) {
+  let top = null;
+  try { if (id) top = repo(id).root; } catch { top = null; }
+  const cmds = await ops.sshCommands(git, top);
+  let remotes = [];
+  let email = '';
+  if (top) {
+    try { remotes = (await ops.describe(git, top)).remotes; } catch { remotes = []; }
+    try { email = (await ops.identity(git, top)).email; } catch { email = ''; }
+  } else {
+    try { email = (await git.text(['config', '--global', '--get', 'user.email'], undefined, { quiet: true })).trim(); } catch { email = ''; }
+  }
+  return {
+    dir: S.sshDir(),
+    keys: S.listKeys(),
+    repo: top ? { id, root: top, name: repo(id).name } : null,
+    local: describeSshCommand(cmds.local),
+    global: describeSshCommand(cmds.global),
+    remotes: remotes.map((r) => ({ name: r.name, url: r.url, ssh: S.parseSshUrl(r.url), sshUrl: S.parseSshUrl(r.url) ? null : S.httpsToSsh(r.url) })),
+    email,
+    suggest: { ed25519: S.suggestName('ed25519'), rsa: S.suggestName('rsa') },
+    pages: S.ADD_KEY_PAGES,
+  };
+}
+
+/** 切換金鑰：key 為空字串時恢復成 ssh 預設（移除 core.sshCommand） */
+async function useKey({ id, scope, key }) {
+  const top = scope === 'local' ? repo(id).root : (id ? repo(id).root : null);
+  const value = key ? S.sshCommandFor(S.keyFileOf(key)) : '';
+  await ops.setSshCommand(git, top, { scope, value });
+  ctx.log.info(`SSH 金鑰（${scope === 'local' ? `儲存庫 ${top}` : '全域'}）：${key || (scope === 'local' ? '跟隨全域設定' : '使用 ssh 預設')}`);
+  return sshState(id);
 }
 
 /* ───────────── 監看 .git ───────────── */
@@ -205,11 +350,38 @@ exports.activate = (context) => {
     const dir = await ops.init(git, root);
     return addRepo(dir);
   }));
-  h('clone', ({ url, parent, name }) => network('複製儲存庫', async (net) => {
-    const dest = await ops.clone(git, { url, parent, name }, net);
+  h('clone', ({ url, parent, name, branch, sshKey }) => network('複製儲存庫', async (net) => {
+    const sshCommand = sshKey ? S.sshCommandFor(S.keyFileOf(sshKey)) : '';
+    const dest = await ops.clone(git, { url, parent, name, branch, sshCommand }, net);
     return addRepo(dest);
   }));
   h('defaults', () => ({ cloneDir: setting('cloneDir', '') || os.homedir() }));
+  h('repos', () => repos());
+
+  /* SSH 金鑰 */
+  h('ssh:state', ({ id } = {}) => sshState(id));
+  h('ssh:keys', () => S.listKeys());
+  h('ssh:publicKey', (name) => S.publicKey(name));
+  h('ssh:generate', async (o) => {
+    try { await git.version(); } catch { /* 只是為了確定 git 的位置（Windows 上找 Git 附帶的 ssh-keygen） */ }
+    const r = await S.generate(o, { gitBin: git.bin() });
+    ctx.log.info(`產生 SSH 金鑰 ${r.file}（${r.fingerprint}）`);
+    return r;
+  });
+  h('ssh:test', async ({ host, user, port, key }) => {
+    try { await git.version(); } catch { /* 同上 */ }
+    return S.testConnection({ host, user, port, keyFile: key ? S.keyFileOf(key) : null }, { gitBin: git.bin() });
+  });
+  h('ssh:use', (o) => exclusive('切換 SSH 金鑰', () => useKey(o)));
+  h('ssh:reveal', () => {
+    const dir = S.sshDir();
+    if (!fs.existsSync(dir)) throw new Error('還沒有 ~/.ssh 資料夾，產生金鑰後就會建立');
+    return ctx.shell.openPath(dir);
+  });
+
+  /* 專案交換 */
+  h('openIn', ({ id, ...o }) => openIn(id, o));
+  h('shareFile', ({ id }) => shareFile(id));
   h('repoName', (url) => ops.repoNameFromUrl(url));
 
   /* 讀取 */
@@ -250,6 +422,7 @@ exports.activate = (context) => {
   ex('continue', '繼續', ({ id, message }) => ops.continueOp(git, top(id), { message }));
   ex('addRemote', '新增遠端', ({ id, ...o }) => ops.addRemote(git, top(id), o));
   ex('removeRemote', '移除遠端', ({ id, ...o }) => ops.removeRemote(git, top(id), o));
+  ex('setRemoteUrl', '變更遠端網址', ({ id, ...o }) => ops.setRemoteUrl(git, top(id), o));
   ex('stash', '儲藏', ({ id, ...o }) => ops.stashPush(git, top(id), o));
   ex('stash:apply', '套用儲藏', ({ id, ...o }) => ops.stashApply(git, top(id), o));
   ex('stash:drop', '刪除儲藏', ({ id, ...o }) => ops.stashDrop(git, top(id), o));
@@ -285,9 +458,16 @@ exports.activate = (context) => {
     ctx.commands.register('gitTool.pull', () => toView('pull')),
     ctx.commands.register('gitTool.push', () => toView('push')),
     ctx.commands.register('gitTool.fetch', () => toView('fetch')),
+    ctx.commands.register('gitTool.sshKeys', () => toView('sshKeys')),
     ctx.settings.onDidChange((key) => ctx.ui.emit('settingsChanged', { key, settings: ctx.settings.all() })),
     { dispose: () => { unwatch(); if (running && running.cancel) running.cancel(); } },
   );
+};
+
+/** contributes.exchange.imports 的 handler：接收 git-tool.project */
+exports.importProject = (context, pkg, info) => {
+  if (!ctx) { ctx = context; git = G.createRunner({ gitPath: () => setting('gitPath', ''), onLog }); }
+  return importProject(pkg, info);
 };
 
 /** 其他擴充呼叫受保護指令（拉取、推送）時，確認對話框顯示的說明 */
@@ -306,4 +486,4 @@ exports.deactivate = () => {
 };
 
 // 測試用
-exports._internal = { addRepo, renameRepo, removeRepo, exclusive, setContext: (c) => { ctx = c; git = G.createRunner({ onLog }); } };
+exports._internal = { addRepo, renameRepo, removeRepo, exclusive, sshState, useKey, importProject, projectPayload, shareFile, takePending: () => { const c = pendingCommand; pendingCommand = null; return c; }, setContext: (c) => { ctx = c; git = G.createRunner({ onLog }); } };

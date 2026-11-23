@@ -16,6 +16,8 @@
           <button class="item" data-act="clone">⇣ 複製遠端儲存庫（clone）…</button>
           <button class="item" data-act="addRepo">📁 加入本機儲存庫…</button>
           <button class="item" data-act="initRepo">✚ 在資料夾建立新儲存庫（init）…</button>
+          <div class="sep"></div>
+          <button class="item" data-act="sshKeys">🔑 SSH 金鑰…</button>
         </div>
       </div>
       <div class="menu-wrap">
@@ -25,6 +27,10 @@
           <button class="item" data-act="copyPath">複製路徑</button>
           <button class="item" data-act="renameRepo">重新命名…</button>
           <button class="item" data-act="identity">設定提交者名稱與 email…</button>
+          <button class="item" data-act="sshKeys">SSH 金鑰（這個儲存庫使用哪一把）…</button>
+          <div class="sep"></div>
+          <button class="item" data-act="openIn" id="openInItem" hidden>在其他工具開啟…</button>
+          <button class="item" data-act="shareFile" title="存成 .tdx 交換檔，對方在 ToolDock 開啟後就能複製這個專案">分享專案（存成交換檔）…</button>
           <div class="sep"></div>
           <button class="item" data-act="removeRepo">從清單移除（不刪除檔案）</button>
         </div>
@@ -86,6 +92,7 @@
           <button data-act="clone">⇣ 複製遠端儲存庫…</button>
           <button class="secondary" data-act="addRepo">📁 加入本機儲存庫…</button>
           <button class="secondary" data-act="initRepo">✚ 建立新儲存庫…</button>
+          <button class="secondary" data-act="sshKeys">🔑 SSH 金鑰…</button>
         </div>
         <p class="faint" id="gitVer"></p>
       </div>
@@ -104,6 +111,13 @@
   </footer>
 
   <div id="ctxMenu" class="menu" hidden></div>
+
+  <div id="sshPanel" hidden>
+    <div id="sshBox" role="dialog" aria-labelledby="sshTitle">
+      <div class="sshHead"><span id="sshTitle">🔑 SSH 金鑰</span><button type="button" class="ib" data-ssh="close" title="關閉（Esc）">✕</button></div>
+      <div id="sshBody"></div>
+    </div>
+  </div>
 
   <div id="modal" hidden>
     <form id="modalBox" autocomplete="off">

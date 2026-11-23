@@ -65,10 +65,12 @@ function explain(stderr = '', stdout = '') {
     [/Please tell me who you are|unable to auto-detect email address|empty ident name/i, 'NO_IDENTITY', '還沒有設定提交者的名稱與 email'],
     [/could not read (Username|Password)|terminal prompts disabled|Authentication failed|Invalid username or password|HTTP Basic: Access denied|returned error: 40[13]/i, 'AUTH',
       '遠端需要登入。請先在終端機對這個遠端執行一次 git（讓系統的認證管理員記住帳號），或改用 SSH 金鑰'],
-    [/Permission denied \(publickey|Could not read from remote repository/i, 'AUTH', '無法用 SSH 金鑰登入遠端。請確認金鑰已加入 ssh-agent、公鑰已加到遠端帳號，並且有這個儲存庫的權限'],
-    [/Host key verification failed/i, 'AUTH', 'SSH 主機金鑰未確認。請先在終端機執行一次 ssh 連線（例如 ssh -T git@github.com）並接受主機金鑰'],
+    [/REMOTE HOST IDENTIFICATION HAS CHANGED/i, 'SSH_HOST_CHANGED', 'SSH 主機金鑰和上次記住的不同，git 拒絕連線（可能是主機換了金鑰，也可能有人冒充）。請先向對方確認新的主機金鑰'],
+    [/Host key verification failed|No .* host key is known/i, 'SSH_HOST', 'SSH 主機金鑰還沒有確認。請在「SSH 金鑰」測試一次連線，記住這台主機'],
+    [/Permission denied \(publickey/i, 'SSH_KEY', '無法用 SSH 金鑰登入遠端。請在「SSH 金鑰」產生金鑰，並把公鑰加到遠端帳號'],
     [/Could not resolve host|unable to access .*(Failed to connect|Couldn't connect|timed out)|Connection (refused|timed out)|Network is unreachable/i, 'NETWORK', '無法連線到遠端，請檢查網路或遠端網址'],
     [/repository .* not found|does not appear to be a git repository|Repository not found/i, 'NOT_FOUND', '找不到遠端儲存庫，請確認網址與權限'],
+    [/Could not read from remote repository/i, 'AUTH', '無法讀取遠端儲存庫。請確認有這個儲存庫的權限，使用 SSH 時請確認公鑰已加到遠端帳號'],
     [/\[rejected\].*\((fetch first|non-fast-forward)\)|Updates were rejected because/i, 'REJECTED', '遠端有你還沒有的提交，推送被拒絕。請先拉取（pull）再推送'],
     [/Not possible to fast-forward|fatal: Not possible to fast-forward/i, 'NOT_FF', '無法快轉：本機與遠端各有新的提交。請改用合併或重定基底的拉取方式'],
     [/no tracking information|There is no tracking information/i, 'NO_UPSTREAM', '目前分支沒有設定追蹤的遠端分支'],
@@ -204,6 +206,8 @@ function createRunner({ gitPath = () => '', onLog = () => {} } = {}) {
   }
   git.text = async (args, cwd, opts) => (await git(args, cwd, opts)).stdout.toString('utf8');
   git.version = async () => (await git.text(['--version'], undefined, { quiet: true })).trim();
+  /** 實際使用的 git 執行檔（執行過一次 git 之後才確定）；Windows 上用來找 Git 附帶的 ssh */
+  git.bin = () => resolved || gitPath() || null;
   return git;
 }
 
