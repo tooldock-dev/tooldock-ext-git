@@ -1,6 +1,6 @@
 {
   "name": "git-tool",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "簡單的 Git 工具：複製、逐行暫存與提交、推送與拉取（含標籤）、分支線圖、互動式重定基底、檔案歷史與衝突解決",
   "main": "backend/index.js",
   "private": true,
