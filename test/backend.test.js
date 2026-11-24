@@ -58,6 +58,7 @@ test('錯誤說明', () => {
   assert.equal(G.explain('fatal: could not read Username for \'https://github.com\': terminal prompts disabled').code, 'AUTH');
   assert.equal(G.explain(' ! [rejected]        main -> main (fetch first)\nerror: failed to push').code, 'REJECTED');
   assert.equal(G.explain('*** Please tell me who you are.').code, 'NO_IDENTITY');
+  assert.equal(G.explain('error: cannot rebase: You have unstaged changes.\nerror: Please commit or stash them.').code, 'DIRTY');
   const e = G.explain('hint: x\nfatal: something odd\n');
   assert.equal(e.code, 'GIT_FAILED');
   assert.equal(e.message, 'something odd');
@@ -346,4 +347,292 @@ test('網路操作可以取消', () => withTmp(async (dir) => {
 test('輸出紀錄：每個指令都有紀錄，失敗時含錯誤', () => {
   assert.ok(logs.some((l) => l.args[0] === 'commit' && l.ok));
   assert.ok(logs.some((l) => !l.ok && l.message));
+});
+
+const check = (d) => `${C.textHash(d.left.text)}:${C.textHash(d.right.text)}`;
+const show = async (dir, spec) => (await git.text(['show', spec], dir, { quiet: true }));
+
+test('逐行暫存：暫存、取消暫存、捨棄一部分的行，保留 CRLF 與執行權限', async () => {
+  await withTmp(async (dir) => {
+    const { work } = await setup(dir);
+    // a.txt：line1 line2 line3 → 改 line1、在最後加 line4
+    write(work, 'a.txt', 'LINE1\nline2\nline3\nline4\n');
+    let d = await ops.diffSides(git, work, { area: 'unstaged', path: 'a.txt' });
+    // 只暫存新增的 line4（右側第 3 行）
+    await ops.partial(git, work, { area: 'unstaged', action: 'stage', path: 'a.txt', add: [3], check: check(d) });
+    assert.equal(await show(work, ':a.txt'), 'line1\nline2\nline3\nline4\n');
+    let s = await ops.status(git, work);
+    assert.equal(s.staged.length, 1);
+    assert.equal(s.unstaged.length, 1);
+    // 內容改變後舊的雜湊被拒絕
+    await assert.rejects(ops.partial(git, work, { area: 'unstaged', action: 'stage', path: 'a.txt', add: [0], check: check(d) }), /修改過/);
+    // 取消暫存 line4
+    d = await ops.diffSides(git, work, { area: 'staged', path: 'a.txt' });
+    await ops.partial(git, work, { area: 'staged', action: 'unstage', path: 'a.txt', add: [3], check: check(d) });
+    s = await ops.status(git, work);
+    assert.equal(s.staged.length, 0);
+    // 捨棄 LINE1 的修改（左 0 刪除、右 0 新增），保留 line4
+    d = await ops.diffSides(git, work, { area: 'unstaged', path: 'a.txt' });
+    await ops.partial(git, work, { area: 'unstaged', action: 'discard', path: 'a.txt', del: [0], add: [0], check: check(d) });
+    assert.equal(read(work, 'a.txt'), 'line1\nline2\nline3\nline4\n');
+    // 選取全部變更時改用整個檔案暫存
+    d = await ops.diffSides(git, work, { area: 'unstaged', path: 'a.txt' });
+    const r = await ops.partial(git, work, { area: 'unstaged', action: 'stage', path: 'a.txt', add: [3], check: check(d) });
+    assert.equal(r.whole, true);
+
+    // CRLF 檔案與執行權限
+    write(work, 'run.sh', 'echo 1\r\necho 2\r\n');
+    fs.chmodSync(path.join(work, 'run.sh'), 0o755);
+    await ops.stage(git, work, ['run.sh']);
+    await ops.commit(git, work, { message: 'run' });
+    write(work, 'run.sh', 'echo 0\r\necho 1\r\necho 2\r\necho 3\r\n');
+    d = await ops.diffSides(git, work, { area: 'unstaged', path: 'run.sh' });
+    await ops.partial(git, work, { area: 'unstaged', action: 'stage', path: 'run.sh', add: [3], check: check(d) });
+    assert.equal(await show(work, ':run.sh'), 'echo 1\r\necho 2\r\necho 3\r\n');
+    if (process.platform !== 'win32') assert.match(await git.text(['ls-files', '-s', 'run.sh'], work), /^100755 /);
+
+    // 未追蹤的檔案只暫存一部分
+    write(work, 'new.txt', 'n1\nn2\n');
+    d = await ops.diffSides(git, work, { area: 'untracked', path: 'new.txt' });
+    await ops.partial(git, work, { area: 'untracked', action: 'stage', path: 'new.txt', add: [0], check: check(d) });
+    assert.equal(await show(work, ':new.txt'), 'n1\n');
+    // 只有 BOM 的檔案保留 BOM
+    write(work, 'bom.txt', '﻿b1\n');
+    await ops.stage(git, work, ['bom.txt']);
+    write(work, 'bom.txt', '﻿b1\nb2\n');
+    d = await ops.diffSides(git, work, { area: 'unstaged', path: 'bom.txt' });
+    assert.equal(d.right.bom, true);
+    await ops.partial(git, work, { area: 'unstaged', action: 'stage', path: 'bom.txt', add: [1], check: check(d) });
+    assert.equal(await show(work, ':bom.txt'), '﻿b1\nb2\n');
+  });
+});
+
+test('標籤：推送單一標籤、推送全部、刪除遠端標籤；推送時一併推送標籤', async () => {
+  await withTmp(async (dir) => {
+    const { remote, work } = await setup(dir);
+    await ops.push(git, work, {});
+    await ops.createTag(git, work, { name: 'v1' });
+    await ops.createTag(git, work, { name: 'v2', message: '第二版' });
+    const remoteTags = async () => (await git.text(['tag', '-l'], remote)).split('\n').filter(Boolean);
+    await ops.pushTag(git, work, { name: 'v1' });
+    assert.deepEqual(await remoteTags(), ['v1']);
+    await ops.pushTag(git, work, {});
+    assert.deepEqual(await remoteTags(), ['v1', 'v2']);
+    await ops.deleteRemoteTag(git, work, { name: 'v1' });
+    assert.deepEqual(await remoteTags(), ['v2']);
+    await assert.rejects(ops.pushTag(git, work, { name: '-x' }), /不正確/);
+    await ops.createTag(git, work, { name: 'v3' });
+    write(work, 'a.txt', 'changed\n');
+    await ops.stageAll(git, work);
+    await ops.commit(git, work, { message: '第二個提交' });
+    const r = await ops.push(git, work, { tags: true });
+    assert.equal(r.tags, true);
+    assert.deepEqual(await remoteTags(), ['v1', 'v2', 'v3']);
+  });
+});
+
+test('提交選項、儲藏選取的檔案、加入 .gitignore、存成 patch、與工作目錄比較', async () => {
+  await withTmp(async (dir) => {
+    const { work } = await setup(dir);
+    fs.mkdirSync(path.join(work, '.git', 'hooks'), { recursive: true });
+    fs.writeFileSync(path.join(work, '.git', 'hooks', 'pre-commit'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    write(work, 'b.txt', 'b\n');
+    await ops.stage(git, work, ['b.txt']);
+    if (process.platform !== 'win32') await assert.rejects(ops.commit(git, work, { message: '被 hook 擋下' }));
+    await ops.commit(git, work, { message: '略過 hook', noVerify: true, signoff: true });
+    assert.match(await git.text(['log', '-1', '--format=%B'], work), /Signed-off-by: Tester <t@example.com>/);
+
+    write(work, 'a.txt', 'A\n');
+    write(work, 'c.txt', 'c\n');
+    await ops.stashPush(git, work, { paths: ['a.txt'], message: '只有 a' });
+    let s = await ops.status(git, work);
+    assert.deepEqual(s.unstaged.map((e) => e.path), []);
+    assert.deepEqual(s.untracked.map((e) => e.path), ['c.txt']);
+
+    assert.equal(ops.addIgnore(work, { pattern: '*.log' }).added, true);
+    assert.equal(ops.addIgnore(work, { pattern: '*.log' }).added, false);
+    assert.equal(read(work, '.gitignore'), '*.log\n');
+    assert.throws(() => ops.addIgnore(work, { pattern: 'a\nb' }), /不正確/);
+
+    const head = (await git.text(['rev-parse', 'HEAD'], work)).trim();
+    const patch = (await ops.formatPatch(git, work, { hash: head })).toString('utf8');
+    assert.match(patch, /^From [0-9a-f]+/);
+    assert.match(patch, /b\.txt/);
+
+    write(work, 'b.txt', 'b2\n');
+    const files = await ops.compareWorking(git, work, { hash: head });
+    assert.deepEqual(files.map((f) => f.path), ['b.txt']);
+    const d = await ops.compareWorkingDiff(git, work, { hash: head, path: 'b.txt' });
+    assert.equal(d.left.text, 'b\n');
+    assert.equal(d.right.text, 'b2\n');
+  });
+});
+
+test('重定基底：rebase onto、互動式（重新排序、squash、fixup、reword、drop）、修改舊提交的訊息', async () => {
+  await withTmp(async (dir) => {
+    const { work } = await setup(dir);
+    const base = (await git.text(['rev-parse', 'HEAD'], work)).trim();
+    for (const n of ['one', 'two', 'three', 'four']) {
+      write(work, `${n}.txt`, `${n}\n`);
+      await ops.stage(git, work, [`${n}.txt`]);
+      await ops.commit(git, work, { message: `add ${n}` });
+    }
+    const list = await ops.rebaseList(git, work, { base });
+    assert.deepEqual(list.map((c) => c.subject), ['add one', 'add two', 'add three', 'add four']);
+    const [one, two, three, four] = list;
+    await assert.rejects(ops.interactiveRebase(git, work, { base, steps: [{ hash: two.hash, action: 'fixup' }, { hash: one.hash, action: 'pick' }, { hash: three.hash, action: 'pick' }, { hash: four.hash, action: 'pick' }] }), /第一個/);
+    const r = await ops.interactiveRebase(git, work, { base, steps: [
+      { hash: three.hash, action: 'reword', message: '三（改過的訊息）' },
+      { hash: one.hash, action: 'pick' },
+      { hash: two.hash, action: 'fixup' },
+      { hash: four.hash, action: 'drop' },
+    ] });
+    assert.equal(r.conflict, false);
+    const subjects = (await git.text(['log', '--format=%s', `${base}..HEAD`], work)).trim().split('\n');
+    assert.deepEqual(subjects, ['add one', '三（改過的訊息）']);
+    assert.ok(!fs.existsSync(path.join(work, 'four.txt')));
+    assert.ok(fs.existsSync(path.join(work, 'two.txt')));
+    // squash 並指定合併後的訊息
+    const l2 = await ops.rebaseList(git, work, { base });
+    await ops.interactiveRebase(git, work, { base, steps: [{ hash: l2[0].hash, action: 'pick' }, { hash: l2[1].hash, action: 'squash', message: '合併：一二三' }] });
+    assert.equal((await git.text(['log', '--format=%s', `${base}..HEAD`], work)).trim(), '合併：一二三');
+    // 修改 HEAD 與較早提交的訊息；HEAD 修改時不帶入暫存的變更
+    write(work, 'x.txt', 'x\n');
+    await ops.stage(git, work, ['x.txt']);
+    await ops.reword(git, work, { hash: (await git.text(['rev-parse', 'HEAD'], work)).trim(), message: '新的 HEAD 訊息' });
+    assert.equal((await git.text(['log', '-1', '--format=%s'], work)).trim(), '新的 HEAD 訊息');
+    assert.equal((await ops.status(git, work)).staged.length, 1);
+    await ops.commit(git, work, { message: 'add x' });
+    const mid = (await git.text(['rev-parse', 'HEAD~1'], work)).trim();
+    await ops.reword(git, work, { hash: mid, message: '改舊的訊息' });
+    assert.deepEqual((await git.text(['log', '--format=%s', `${base}..HEAD`], work)).trim().split('\n'), ['add x', '改舊的訊息']);
+    // 重定基底到其他分支
+    await ops.createBranch(git, work, { name: 'side', from: base, checkout: true });
+    write(work, 'side.txt', 's\n');
+    await ops.stage(git, work, ['side.txt']);
+    await ops.commit(git, work, { message: 'side' });
+    const rr = await ops.rebaseOnto(git, work, { onto: 'main' });
+    assert.equal(rr.conflict, false);
+    assert.equal((await git.text(['log', '--format=%s', '-2'], work)).trim(), 'side\nadd x');
+  });
+});
+
+test('檔案歷史（跟著重新命名）、逐行追溯、圖片差異', async () => {
+  await withTmp(async (dir) => {
+    const { work } = await setup(dir);
+    write(work, 'a.txt', 'line1\nLINE2\nline3\n');
+    await ops.stageAll(git, work);
+    await ops.commit(git, work, { message: '改第二行' });
+    await git(['mv', 'a.txt', 'b.txt'], work);
+    await ops.commit(git, work, { message: '改名' });
+    const h = await ops.fileHistory(git, work, { path: 'b.txt' });
+    assert.deepEqual(h.map((x) => x.subject), ['改名', '改第二行', '初始提交']);
+    assert.equal(h[0].status, 'R');
+    assert.equal(h[0].orig, 'a.txt');
+    assert.equal(h[1].path, 'a.txt');
+    write(work, 'b.txt', 'line1\nLINE2\nline3\nnew\n');
+    const b = await ops.blame(git, work, { path: 'b.txt' });
+    assert.deepEqual(b.lines.map((l) => l.text), ['line1', 'LINE2', 'line3', 'new']);
+    assert.equal(b.commits[b.lines[1].hash].summary, '改第二行');
+    assert.equal(b.commits[b.lines[0].hash].summary, '初始提交');
+    assert.match(b.lines[3].hash, /^0+$/);
+    // 圖片：二進位時附上 data URL
+    const png = Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010806000000', 'hex');
+    fs.writeFileSync(path.join(work, 'x.png'), png);
+    const d = await ops.diffSides(git, work, { area: 'untracked', path: 'x.png' });
+    assert.match(d.right.image, /^data:image\/png;base64,/);
+  });
+});
+
+test('拉取指定遠端分支、比對遠端標籤、擷取時清除標籤、假設未變更', async () => {
+  await withTmp(async (dir) => {
+    const { remote, work } = await setup(dir);
+    await ops.push(git, work, {});
+    // 另一份複製推送 feature 分支與標籤
+    const other = path.join(dir, 'other');
+    await git(['clone', '-q', remote, other], dir);
+    await git(['checkout', '-q', '-b', 'feature'], other);
+    write(other, 'f.txt', 'f\n');
+    await git(['add', '-A'], other);
+    await git(['commit', '-qm', 'feature'], other);
+    await git(['push', '-q', 'origin', 'feature'], other);
+    await git(['tag', 'r1'], other);
+    await git(['push', '-q', 'origin', 'r1'], other);
+    const r = await ops.pull(git, work, { mode: 'merge', remote: 'origin', branch: 'feature' });
+    assert.equal(r.conflict, false);
+    assert.ok(fs.existsSync(path.join(work, 'f.txt')));
+    await ops.createTag(git, work, { name: 'local-only' });
+    const rt = await ops.remoteTags(git, work, {});
+    assert.deepEqual(rt.tags, ['r1']);
+    // 遠端刪除 r1 後，擷取並清除標籤會刪掉本機的 r1
+    await ops.fetchAll(git, work);
+    assert.match(await git.text(['tag', '-l', 'r1'], work), /r1/);
+    await git(['push', '-q', 'origin', '--delete', 'refs/tags/r1'], other);
+    await ops.fetchAll(git, work, undefined, { pruneTags: true });
+    assert.equal((await git.text(['tag', '-l', 'r1'], work)).trim(), '');
+    // 假設未變更
+    write(work, 'a.txt', 'changed\n');
+    await ops.assumeUnchanged(git, work, { paths: ['a.txt'] });
+    let s = await ops.status(git, work);
+    assert.deepEqual(s.unstaged, []);
+    assert.deepEqual(s.assumed.map((x) => x.path), ['a.txt']);
+    await ops.assumeUnchanged(git, work, { paths: ['a.txt'], on: false });
+    s = await ops.status(git, work);
+    assert.deepEqual(s.unstaged.map((x) => x.path), ['a.txt']);
+    assert.deepEqual(s.assumed, []);
+  });
+});
+
+test('參照紀錄、比較兩個提交、搜尋歷史、子模組、工作樹', async () => {
+  await withTmp(async (dir) => {
+    const { remote, work } = await setup(dir);
+    const first = (await git.text(['rev-parse', 'HEAD'], work)).trim();
+    write(work, 'a.txt', 'line1\nneedle\nline3\n');
+    write(work, 'n.txt', 'n\n');
+    await ops.stageAll(git, work);
+    await ops.commit(git, work, { message: 'Add Needle' });
+    const second = (await git.text(['rev-parse', 'HEAD'], work)).trim();
+    await ops.reset(git, work, { hash: first, mode: 'hard' });
+    const rl = await ops.reflog(git, work);
+    assert.ok(rl.some((e) => e.hash === second), 'reset 之前的提交仍在參照紀錄中');
+    assert.match(rl[0].action, /reset/);
+    await ops.reset(git, work, { hash: second, mode: 'hard' });
+    assert.deepEqual((await ops.compareRange(git, work, { from: first, to: second })).map((f) => f.path).sort(), ['a.txt', 'n.txt']);
+    const s1 = await ops.log(git, work, { search: { mode: 'content', text: 'needle' } });
+    assert.deepEqual(s1.commits.map((c) => c.subject), ['Add Needle']);
+    const s2 = await ops.log(git, work, { search: { mode: 'message', text: 'add needle' } });
+    assert.equal(s2.commits.length, 1);
+    const s3 = await ops.log(git, work, { search: { mode: 'author', text: 'nobody' } });
+    assert.equal(s3.commits.length, 0);
+    await assert.rejects(ops.log(git, work, { search: { mode: 'content', text: 'a\nb' } }), /換行/);
+
+    // 子模組：用 bare 遠端當子模組的來源
+    await ops.push(git, work, {});
+    await git(['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', remote, 'lib/sub'], work);
+    await ops.commit(git, work, { message: 'add submodule' });
+    let subs = await ops.submodules(git, work);
+    assert.deepEqual(subs.map((x) => [x.path, x.state]), [['lib/sub', 'ok']]);
+    const clone = path.join(dir, 'clone');
+    await ops.push(git, work, {});
+    await git(['clone', '-q', remote, clone], dir);
+    subs = await ops.submodules(git, clone);
+    assert.equal(subs[0].state, 'uninit');
+    process.env.GIT_CONFIG_COUNT = '1';
+    process.env.GIT_CONFIG_KEY_0 = 'protocol.file.allow';
+    process.env.GIT_CONFIG_VALUE_0 = 'always';
+    try { await ops.submoduleUpdate(git, clone, {}); } finally { delete process.env.GIT_CONFIG_COUNT; delete process.env.GIT_CONFIG_KEY_0; delete process.env.GIT_CONFIG_VALUE_0; }
+    assert.equal((await ops.submodules(git, clone))[0].state, 'ok');
+
+    // 工作樹
+    const wt = path.join(dir, 'wt');
+    await ops.addWorktree(git, work, { dir: wt, newBranch: 'wt-branch' });
+    let list = await ops.worktrees(git, work);
+    assert.equal(list.length, 2);
+    assert.equal(list[0].main, true);
+    assert.equal(list[1].branch, 'wt-branch');
+    await assert.rejects(ops.removeWorktree(git, work, { dir: work }), /主要/);
+    await ops.removeWorktree(git, work, { dir: wt });
+    list = await ops.worktrees(git, work);
+    assert.equal(list.length, 1);
+  });
 });

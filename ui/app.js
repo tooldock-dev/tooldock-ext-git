@@ -24,7 +24,15 @@ const st = {
   active: null,
   seq: 0,
   collapsed: new Set(),
-  selChange: '',
+  selChange: '', // 變更清單中焦點所在的檔案（area\npath）
+  sel: new Set(), // 變更清單中選取的檔案
+  anchor: '', // Shift 連選的起點
+  chgFilter: '',
+  chgView: 'list', // list | tree
+  commitOpts: { noVerify: false, signoff: false, push: false },
+  diffWs: false, // 比對時忽略空白
+  diffWrap: true, // 比對時自動換行
+  brFilter: '',
   busy: null,
   progress: null,
   diffMode: 'sbs',
@@ -252,6 +260,13 @@ async function selectRepo(id) {
   st.branches = null;
   st.stashes = [];
   st.selChange = '';
+  st.remoteTags = null;
+  st.cmpBase = null;
+  st.subs = null;
+  st.worktrees = null;
+  st.search = null;
+  st.sel.clear();
+  st.anchor = '';
   st.msgTouched = false;
   $('#msg').value = '';
   $('#amend').checked = false;
@@ -741,51 +756,133 @@ function renderCommitBox() {
     if (!st.msgTouched && s.mergeMessage && !msg.value) msg.value = s.mergeMessage;
     $('#amend').closest('label').hidden = true;
   } else {
-    btn.textContent = '✓ 提交';
-    btn.title = '提交已暫存的變更（⌘Enter）';
+    const n = s ? s.staged.length : 0;
+    btn.textContent = n ? `✓ 提交 ${n} 個檔案` : '✓ 提交';
+    btn.title = `提交已暫存的變更（${IS_MAC ? '⌘' : 'Ctrl+'}Enter）${st.commitOpts.push ? '，完成後推送' : ''}`;
     $('#amend').closest('label').hidden = !s || s.noCommits;
   }
-  msg.placeholder = s && s.branch ? `提交訊息（在 ${s.branch} 上提交，${IS_MAC ? '⌘' : 'Ctrl+'}Enter）` : '提交訊息';
+  msg.placeholder = s && s.branch ? `提交訊息（在 ${s.branch} 上提交，${IS_MAC ? '⌘' : 'Ctrl+'}Enter）\n第一行是摘要，空一行後寫詳細說明` : '提交訊息';
+  renderMsgLen();
+}
+
+/** 摘要（第一行）的字數：超過 72 時提示 */
+function renderMsgLen() {
+  const first = $('#msg').value.split('\n')[0];
+  const n = [...first].length;
+  const el = $('#msgLen');
+  el.textContent = n ? String(n) : '';
+  el.className = n > 72 ? 'warn' : '';
+  el.title = n > 72 ? `摘要有 ${n} 個字，建議不超過 72（太長時在其他工具中會被截斷）` : '摘要（第一行）的字數，建議不超過 72';
+  const o = st.commitOpts;
+  $('#commitOpts').classList.toggle('on', o.noVerify || o.signoff || o.push);
+}
+
+function commitOptsMenu() {
+  const o = st.commitOpts;
+  const flip = (k) => () => { o[k] = !o[k]; store.set('commitOpts', o); renderCommitBox(); };
+  menuBelow($('#commitOpts'), [
+    { label: '提交選項' },
+    [`${o.push ? '✓' : '　'} 提交後推送`, flip('push')],
+    [`${o.signoff ? '✓' : '　'} 加上 Signed-off-by（--signoff）`, flip('signoff')],
+    [`${o.noVerify ? '✓' : '　'} 略過 Git hooks（--no-verify）`, flip('noVerify')],
+  ]);
+}
+
+function msgHistMenu() {
+  const list = store.get('msgHist', []);
+  if (!list.length) { notice('還沒有提交過的訊息'); return; }
+  menuBelow($('#msgHist'), [{ label: '最近使用的提交訊息' }, ...list.map((m) => [m.split('\n')[0].slice(0, 80), () => {
+    $('#msg').value = m;
+    st.msgTouched = true;
+    renderMsgLen();
+    $('#msg').focus();
+  }])]);
+}
+
+function rememberMsg(m) {
+  const t = String(m || '').trim();
+  if (!t) return;
+  store.set('msgHist', [t, ...store.get('msgHist', []).filter((x) => x !== t)].slice(0, 20));
 }
 
 /* ───────────── 變更清單 ───────────── */
 
-const GROUPS = [['conflict', '合併衝突'], ['staged', '已暫存的變更'], ['unstaged', '變更'], ['untracked', '未追蹤的檔案']];
+const GROUPS = [['conflict', '合併衝突'], ['staged', '已暫存的變更'], ['unstaged', '變更'], ['untracked', '未追蹤的檔案'], ['assumed', '假設未變更的檔案']];
+const keyOf = (area, p) => `${area}\n${p}`;
+const splitKey = (k) => { const i = k.indexOf('\n'); return [k.slice(0, i), k.slice(i + 1)]; };
+const isMod = (e) => (IS_MAC ? e.metaKey : e.ctrlKey);
+
+/** 符合篩選的檔案 */
+function shown(area) {
+  const q = st.chgFilter.trim().toLowerCase();
+  const list = st.status[area];
+  return q ? list.filter((e) => e.path.toLowerCase().includes(q)) : list;
+}
+
+function groupActs(area, attr) {
+  if (area === 'staged') return `<button class="ib sm" ${attr}="unstage" title="全部取消暫存">−</button>`;
+  if (area === 'unstaged') return `<button class="ib sm" ${attr}="discard" title="捨棄全部變更">↺</button><button class="ib sm" ${attr}="stage" title="全部暫存">＋</button>`;
+  if (area === 'untracked') return `<button class="ib sm" ${attr}="discard" title="刪除全部未追蹤的檔案">🗑</button><button class="ib sm" ${attr}="stage" title="全部暫存">＋</button>`;
+  if (area === 'assumed') return `<button class="ib sm" ${attr}="unassume" title="全部取消「假設未變更」">↶</button>`;
+  return '';
+}
+
+function fileRow(area, e, depth, tree) {
+  const key = keyOf(area, e.path);
+  let ra = '';
+  if (area === 'conflict') ra = '<button class="ib sm" data-ract="resolve" title="解決衝突">⚡</button>';
+  else if (area === 'staged') ra = '<button class="ib sm" data-ract="openFile" title="開啟檔案">↗</button><button class="ib sm" data-ract="unstage" title="取消暫存">−</button>';
+  else if (area === 'assumed') ra = '<button class="ib sm" data-ract="unassume" title="取消「假設未變更」，重新顯示這個檔案的變更">↶</button>';
+  else if (area === 'unstaged') ra = `${e.status !== 'D' ? '<button class="ib sm" data-ract="openFile" title="開啟檔案">↗</button>' : ''}<button class="ib sm" data-ract="discard" title="捨棄變更">↺</button><button class="ib sm" data-ract="stage" title="暫存">＋</button>`;
+  else ra = '<button class="ib sm" data-ract="openFile" title="開啟檔案">↗</button><button class="ib sm" data-ract="discard" title="刪除檔案">🗑</button><button class="ib sm" data-ract="stage" title="暫存">＋</button>';
+  const tip = `${e.path}${e.orig ? `（原為 ${e.orig}）` : ''}・${e.label}`;
+  const pad = tree ? ` style="padding-left:${12 + depth * 14}px"` : '';
+  return `<div class="row f${st.sel.has(key) ? ' sel' : ''}${st.selChange === key ? ' focus' : ''}" data-area="${area}" data-path="${esc(e.path)}" title="${esc(tip)}"${pad}>`
+    + `<span class="nm g-${esc(e.status)}${e.status === 'D' ? ' del' : ''}">${esc(basename(e.path))}</span><span class="dir">${tree ? '' : esc(dirname(e.path))}</span>`
+    + `<span class="acts">${ra}</span><span class="gs g-${esc(e.status)}">${area === 'conflict' ? '!' : esc(e.status === '?' ? 'U' : e.status)}</span></div>`;
+}
+
+function treeRows(area, node, depth, out) {
+  const count = (n) => n.items.length + n.dirs.reduce((s, d) => s + count(d), 0);
+  for (const d of node.dirs) {
+    const k = `d:${area}:${d.path}`;
+    const closed = st.collapsed.has(k);
+    out.push(`<div class="row dirrow" data-area="${area}" data-dir="${esc(d.path)}" style="padding-left:${2 + depth * 14}px" title="${esc(d.path)}/">`
+      + `<span class="tw">${closed ? '▸' : '▾'}</span><span class="ic">📁</span><span class="nm">${esc(d.name)}</span><span class="dir"></span>`
+      + `<span class="acts">${groupActs(area, 'data-dact')}</span><span class="meta">${count(d)}</span></div>`);
+    if (!closed) treeRows(area, d, depth + 1, out);
+  }
+  for (const e of node.items) out.push(fileRow(area, e, depth, true));
+}
 
 function renderChanges() {
   const s = st.status;
   const box = $('#changes');
   const total = s.conflict.length + s.staged.length + s.unstaged.length + s.untracked.length;
+  s.assumed = s.assumed || [];
   $('#chgCount').hidden = !total;
   $('#chgCount').textContent = total > 999 ? '999+' : String(total);
-  if (!total) {
+  $('#chgView').textContent = st.chgView === 'tree' ? '🗂' : '☰';
+  $('#chgView').title = st.chgView === 'tree' ? '目前：樹狀檢視（點選切換成清單）' : '目前：清單檢視（點選切換成樹狀）';
+  // 已經不存在的檔案從選取中移除
+  for (const k of [...st.sel]) { const [a, p] = splitKey(k); if (!entryOf(a, p)) st.sel.delete(k); }
+  if (!total && !s.assumed.length) {
     box.innerHTML = `<div class="empty-msg">沒有任何變更，工作目錄是乾淨的。${s.noCommits ? '<br>這個儲存庫還沒有任何提交：新增檔案後會出現在這裡。' : ''}</div>`;
     return;
   }
   const out = [];
+  const tree = st.chgView === 'tree';
   for (const [area, title] of GROUPS) {
-    const list = s[area];
-    if (!list.length) continue;
+    const list = shown(area);
+    if (!s[area].length) continue;
     const closed = st.collapsed.has(area);
-    let acts = '';
-    if (area === 'staged') acts = '<button class="ib sm" data-gact="unstageAll" title="全部取消暫存">−</button>';
-    else if (area === 'unstaged') acts = '<button class="ib sm" data-gact="discardAll" title="捨棄全部變更">↺</button><button class="ib sm" data-gact="stageUnstaged" title="全部暫存">＋</button>';
-    else if (area === 'untracked') acts = '<button class="ib sm" data-gact="cleanAll" title="刪除全部未追蹤的檔案">🗑</button><button class="ib sm" data-gact="stageUntracked" title="全部暫存">＋</button>';
-    out.push(`<div class="grp-h ${area}" data-grp="${area}"><span class="tw">${closed ? '▸' : '▾'}</span>${title}<span class="n">${list.length}</span><span class="acts">${acts}</span></div>`);
+    const n = list.length === s[area].length ? `${list.length}` : `${list.length}／${s[area].length}`;
+    out.push(`<div class="grp-h ${area}" data-grp="${area}"><span class="tw">${closed ? '▸' : '▾'}</span>${title}<span class="n">${n}</span><span class="acts">${groupActs(area, 'data-gact')}</span></div>`);
     if (closed) continue;
-    for (const e of list) {
-      const key = `${area}:${e.path}`;
-      let ra = '';
-      if (area === 'conflict') ra = '<button class="ib sm" data-ract="resolve" title="解決衝突">⚡</button>';
-      else if (area === 'staged') ra = '<button class="ib sm" data-ract="openFile" title="開啟檔案">↗</button><button class="ib sm" data-ract="unstage" title="取消暫存">−</button>';
-      else if (area === 'unstaged') ra = `${e.status !== 'D' ? '<button class="ib sm" data-ract="openFile" title="開啟檔案">↗</button>' : ''}<button class="ib sm" data-ract="discard" title="捨棄變更">↺</button><button class="ib sm" data-ract="stage" title="暫存">＋</button>`;
-      else ra = '<button class="ib sm" data-ract="openFile" title="開啟檔案">↗</button><button class="ib sm" data-ract="discard" title="刪除檔案">🗑</button><button class="ib sm" data-ract="stage" title="暫存">＋</button>';
-      const tip = `${e.path}${e.orig ? `（原為 ${e.orig}）` : ''}・${e.label}`;
-      out.push(`<div class="row${st.selChange === key ? ' sel' : ''}" data-area="${area}" data-path="${esc(e.path)}" title="${esc(tip)}">`
-        + `<span class="nm g-${esc(e.status)}${e.status === 'D' ? ' del' : ''}">${esc(basename(e.path))}</span><span class="dir">${esc(dirname(e.path))}</span>`
-        + `<span class="acts">${ra}</span><span class="gs g-${esc(e.status)}">${area === 'conflict' ? '!' : esc(e.status === '?' ? 'U' : e.status)}</span></div>`);
-    }
+    if (tree) treeRows(area, C.buildTree(list), 0, out);
+    else for (const e of list) out.push(fileRow(area, e, 0, false));
   }
+  if (st.chgFilter.trim() && !out.some((x) => x.includes('class="row f'))) out.push('<div class="empty-msg">沒有符合篩選的檔案。</div>');
   box.innerHTML = out.join('');
 }
 
@@ -793,45 +890,186 @@ function entryOf(area, p) {
   return st.status && st.status[area] ? st.status[area].find((e) => e.path === p) : null;
 }
 
-async function onChangeAction(act, area, p) {
-  const s = st.status;
-  const e = entryOf(area, p);
-  if (!e) return;
-  if (act === 'stage') { await api('stage', { paths: [p] }); }
-  else if (act === 'unstage') { await api('unstage', { paths: [p], noCommits: s.noCommits }); }
-  else if (act === 'discard') {
-    if (area === 'untracked') {
-      if (!await confirmBox(`刪除未追蹤的檔案 ${p}？`, '刪除', { type: 'warning', detail: '這個檔案從來沒有提交過，刪除後無法從 Git 復原。' })) return;
-      await api('discard', { untracked: [p] });
-    } else {
-      if (!await confirmBox(`捨棄 ${p} 的變更？`, '捨棄', { type: 'warning', detail: '檔案會還原成上一次暫存或提交的內容，目前的修改無法復原。' })) return;
-      await api('discard', { tracked: [p] });
-    }
-  } else if (act === 'resolve') { openConflict(p); return; }
-  else if (act === 'openFile') { await api('openFile', { path: p }); return; }
-  await refresh();
+/** 畫面上依序排列的檔案（用於 Shift 連選與方向鍵） */
+const rowKeys = () => $$('#changes .row.f').map((r) => keyOf(r.dataset.area, r.dataset.path));
+
+function markSel() {
+  for (const r of $$('#changes .row.f')) {
+    const k = keyOf(r.dataset.area, r.dataset.path);
+    r.classList.toggle('sel', st.sel.has(k));
+    r.classList.toggle('focus', st.selChange === k);
+  }
 }
 
-async function onGroupAction(act) {
+function selectRange(from, to) {
+  const keys = rowKeys();
+  let i = keys.indexOf(from), j = keys.indexOf(to);
+  if (i < 0) i = j;
+  if (i > j) [i, j] = [j, i];
+  st.sel = new Set(keys.slice(i, j + 1));
+}
+
+/** 選取的檔案；沒有選取時用目前焦點的檔案 */
+function selectedItems() {
+  const keys = st.sel.size ? [...st.sel] : st.selChange ? [st.selChange] : [];
+  return keys.map(splitKey).map(([area, p]) => ({ area, path: p, e: entryOf(area, p) })).filter((x) => x.e);
+}
+
+function openEntry(area, p, opts) {
+  if (area === 'assumed') { notice('這個檔案標示為「假設未變更」，git 不會檢查它的變更；取消後才會顯示差異'); return; }
+  if (area === 'conflict') openConflict(p);
+  else openDiff({ kind: 'work', area, ...entryOf(area, p) }, opts);
+}
+
+async function onChangeAction(act, area, p) {
+  const e = entryOf(area, p);
+  if (!e) return;
+  if (act === 'resolve') { openConflict(p); return; }
+  if (act === 'openFile') { await api('openFile', { path: p }); return; }
+  await batchAction(act, [{ area, path: p, e }]);
+}
+
+/**
+ * 對多個檔案執行：stage、unstage、toggle（依選取內容暫存或取消暫存）、discard、stash
+ * items：[{ area, path }]
+ */
+async function batchAction(act, items) {
   const s = st.status;
-  if (act === 'unstageAll') await api('unstageAll', { noCommits: s.noCommits });
-  else if (act === 'stageUnstaged') await api('stage', { paths: s.unstaged.map((e) => e.path) });
-  else if (act === 'stageUntracked') await api('stage', { paths: s.untracked.map((e) => e.path) });
-  else if (act === 'discardAll') {
-    if (!await confirmBox(`捨棄 ${s.unstaged.length} 個檔案的變更？`, '全部捨棄', { type: 'warning', detail: '檔案會還原成上一次暫存或提交的內容，目前的修改無法復原。未追蹤的檔案不受影響。' })) return;
-    await api('discard', { tracked: s.unstaged.map((e) => e.path) });
-  } else if (act === 'cleanAll') {
-    if (!await confirmBox(`刪除 ${s.untracked.length} 個未追蹤的檔案？`, '全部刪除', { type: 'warning', detail: '這些檔案從來沒有提交過，刪除後無法從 Git 復原。' })) return;
-    await api('discard', { untracked: s.untracked.map((e) => e.path) });
+  const uniq = (a) => [...new Set(a)];
+  const toStage = uniq(items.filter((x) => x.area === 'unstaged' || x.area === 'untracked').map((x) => x.path));
+  const toUnstage = uniq(items.filter((x) => x.area === 'staged').map((x) => x.path));
+  if (act === 'toggle') act = toStage.length ? 'stage' : 'unstage';
+  if (act === 'stage') {
+    if (!toStage.length) return;
+    await api('stage', { paths: toStage });
+  } else if (act === 'unstage') {
+    if (!toUnstage.length) return;
+    await api('unstage', { paths: toUnstage, noCommits: s.noCommits });
+  } else if (act === 'discard') {
+    const tracked = uniq(items.filter((x) => x.area === 'unstaged').map((x) => x.path));
+    const untracked = uniq(items.filter((x) => x.area === 'untracked').map((x) => x.path));
+    if (!tracked.length && !untracked.length) { notice('選取的檔案沒有可以捨棄的變更（已暫存的請先取消暫存）'); return; }
+    const one = tracked.length + untracked.length === 1;
+    const msg = one
+      ? (tracked.length ? `捨棄 ${tracked[0]} 的變更？` : `刪除未追蹤的檔案 ${untracked[0]}？`)
+      : [tracked.length ? `捨棄 ${tracked.length} 個檔案的變更` : '', untracked.length ? `刪除 ${untracked.length} 個未追蹤的檔案` : ''].filter(Boolean).join('、') + '？';
+    const detail = [tracked.length ? '已追蹤的檔案會還原成上一次暫存或提交的內容。' : '', untracked.length ? '未追蹤的檔案從來沒有提交過，刪除後無法從 Git 復原。' : '', '這個動作無法復原。'].filter(Boolean).join('\n');
+    if (!await confirmBox(msg, untracked.length && !tracked.length ? '刪除' : '捨棄', { type: 'warning', detail })) return;
+    await api('discard', { tracked, untracked });
+  } else if (act === 'unassume') {
+    const paths = uniq(items.filter((x) => x.area === 'assumed').map((x) => x.path));
+    if (!paths.length) return;
+    await api('assume', { paths, on: false });
+    notice(`已取消 ${paths.length} 個檔案的「假設未變更」`, 'ok');
+  } else if (act === 'assume') {
+    const paths = uniq(items.filter((x) => x.area === 'unstaged' || x.area === 'staged').map((x) => x.path));
+    if (!paths.length) return;
+    if (!await confirmBox(`把 ${paths.length === 1 ? paths[0] : `${paths.length} 個檔案`} 標示為「假設未變更」？`, '標示', { detail: 'git 會當作這些檔案沒有變更：不會出現在變更清單、也不會被暫存或提交。適合本機才需要修改的設定檔。之後可以在變更清單最下面的「假設未變更的檔案」取消。\n已暫存的變更仍然會被提交。' })) return;
+    await api('assume', { paths, on: true });
+  } else if (act === 'stash') {
+    const paths = uniq(items.filter((x) => x.area !== 'conflict' && x.area !== 'assumed').map((x) => x.path));
+    if (!paths.length) return;
+    const v = await form({
+      title: `儲藏 ${paths.length === 1 ? paths[0] : `${paths.length} 個檔案`}`,
+      desc: '只把選取的檔案收起來，其他變更保留在工作目錄。',
+      ok: '儲藏',
+      fields: [{ name: 'message', label: '說明（可省略）' }],
+    });
+    if (!v) return;
+    await api('stash', { message: v.message, untracked: true, paths });
+    notice('已儲藏選取的檔案', 'ok');
+    st.sel.clear();
+    await refreshAll();
+    return;
   }
   await refresh();
 }
 
+async function onGroupAction(act, area, dir) {
+  const s = st.status;
+  const list = dir ? shown(area).filter((e) => e.path.startsWith(`${dir}/`)) : shown(area);
+  if (!list.length) return;
+  // 沒有篩選、整組操作時用 git 的整批指令
+  if (!dir && !st.chgFilter.trim() && area === 'staged' && act === 'unstage') { await api('unstageAll', { noCommits: s.noCommits }); await refresh(); return; }
+  await batchAction(act, list.map((e) => ({ area, path: e.path, e })));
+}
+
+async function ignoreFlow(pattern) {
+  const r = await api('ignore', { pattern });
+  notice(r.added ? `已加入 .gitignore：${pattern}` : `.gitignore 已經有 ${pattern}`, 'ok');
+  await refresh();
+}
+
+function ignoreItems(p, isDir) {
+  const ext = !isDir && /\.([^./]+)$/.exec(basename(p));
+  const dir = isDir ? p : dirname(p);
+  return [
+    { label: '加入 .gitignore' },
+    isDir ? null : ['　忽略這個檔案', () => ignoreFlow(`/${p}`)],
+    ext ? [`　忽略所有 *.${ext[1]} 檔案`, () => ignoreFlow(`*.${ext[1]}`)] : null,
+    dir ? [`　忽略資料夾 ${dir}/`, () => ignoreFlow(`/${dir}/`)] : null,
+  ];
+}
+
+function fileMenu(area, p) {
+  const e = entryOf(area, p);
+  const items = [];
+  if (area === 'assumed') {
+    return [
+      ['取消「假設未變更」', () => batchAction('unassume', [{ area, path: p, e }])],
+      '-',
+      ['開啟檔案', () => api('openFile', { path: p })],
+      ['在檔案管理員中顯示', () => api('revealFile', { path: p })],
+      ['複製相對路徑', () => copyText(p)],
+      ['檔案歷史', () => openHistory(p)],
+    ];
+  }
+  if (area === 'conflict') items.push(['解決衝突', () => openConflict(p)]);
+  else items.push(['查看差異', () => openDiff({ kind: 'work', area, ...e }, { pin: true })]);
+  if (area === 'unstaged' || area === 'untracked') items.push(['暫存', () => onChangeAction('stage', area, p)]);
+  if (area === 'staged') items.push(['取消暫存', () => onChangeAction('unstage', area, p)]);
+  items.push('-');
+  if (e && e.status !== 'D') items.push(['開啟檔案', () => api('openFile', { path: p })]);
+  if (e && e.status !== 'D') items.push(['在檔案管理員中顯示', () => api('revealFile', { path: p })], ['在終端機開啟所在的資料夾', () => api('openTerminal', { path: p })]);
+  if (e && e.status !== 'D' && st.targets.length) items.push([targetLabel(), () => openInFlow({ file: p })]);
+  items.push(['複製相對路徑', () => copyText(p)]);
+  if (area !== 'untracked' && !(e && e.status === 'A')) items.push('-', ['檔案歷史', () => openHistory(p)], e && e.status !== 'D' ? ['逐行追溯（blame）', () => openBlame(p)] : null);
+  if (area !== 'conflict') items.push('-', ['儲藏這個檔案…', () => batchAction('stash', [{ area, path: p, e }])]);
+  if (area === 'untracked') items.push('-', ...ignoreItems(p, false));
+  if ((area === 'unstaged' || area === 'staged') && e && e.status !== 'A' && e.status !== 'D') items.push(['假設未變更（不再顯示這個檔案的變更）…', () => batchAction('assume', [{ area, path: p, e }])]);
+  if (area === 'unstaged') items.push('-', ['捨棄變更…', () => onChangeAction('discard', area, p), { danger: true }]);
+  if (area === 'untracked') items.push('-', ['刪除檔案…', () => onChangeAction('discard', area, p), { danger: true }]);
+  return items;
+}
+
+function multiMenu(items) {
+  const n = items.length;
+  const stg = items.filter((x) => x.area === 'unstaged' || x.area === 'untracked').length;
+  const uns = items.filter((x) => x.area === 'staged').length;
+  const dis = items.filter((x) => x.area === 'unstaged' || x.area === 'untracked').length;
+  return [
+    { label: `已選取 ${n} 個檔案` },
+    stg ? [`暫存 ${stg} 個檔案`, () => batchAction('stage', items)] : null,
+    uns ? [`取消暫存 ${uns} 個檔案`, () => batchAction('unstage', items)] : null,
+    items.some((x) => x.area === 'assumed') ? ['取消「假設未變更」', () => batchAction('unassume', items)] : null,
+    '-',
+    [`儲藏這 ${n} 個檔案…`, () => batchAction('stash', items)],
+    ['複製相對路徑', () => copyText(items.map((x) => x.path).join('\n'))],
+    '-',
+    dis ? [`捨棄 ${dis} 個檔案的變更…`, () => batchAction('discard', items), { danger: true }] : null,
+  ];
+}
+
 function initChanges() {
   const box = $('#changes');
+  st.chgView = store.get('chgView', 'list');
+  $('#chgFilter').addEventListener('input', (e) => { st.chgFilter = e.target.value; if (st.status) renderChanges(); });
+  $('#chgFilter').addEventListener('keydown', (e) => { if (e.key === 'ArrowDown') { e.preventDefault(); box.focus(); moveFocus(1, false); } });
+  $('#chgView').onclick = () => { st.chgView = st.chgView === 'tree' ? 'list' : 'tree'; store.set('chgView', st.chgView); if (st.status) renderChanges(); };
+
   box.addEventListener('click', (ev) => {
     const g = ev.target.closest('[data-gact]');
-    if (g) { ev.stopPropagation(); onGroupAction(g.dataset.gact).catch(fail); return; }
+    if (g) { ev.stopPropagation(); onGroupAction(g.dataset.gact, g.closest('.grp-h').dataset.grp).catch(fail); return; }
     const h = ev.target.closest('.grp-h');
     if (h) {
       const a = h.dataset.grp;
@@ -839,42 +1077,81 @@ function initChanges() {
       renderChanges();
       return;
     }
-    const row = ev.target.closest('.row');
+    const dr = ev.target.closest('.dirrow');
+    if (dr) {
+      const da = ev.target.closest('[data-dact]');
+      if (da) { onGroupAction(da.dataset.dact, dr.dataset.area, dr.dataset.dir).catch(fail); return; }
+      const k = `d:${dr.dataset.area}:${dr.dataset.dir}`;
+      if (st.collapsed.has(k)) st.collapsed.delete(k); else st.collapsed.add(k);
+      renderChanges();
+      return;
+    }
+    const row = ev.target.closest('.row.f');
     if (!row) return;
     const { area, path: p } = row.dataset;
     const b = ev.target.closest('[data-ract]');
     if (b) { ev.stopPropagation(); onChangeAction(b.dataset.ract, area, p).catch(fail); return; }
-    st.selChange = `${area}:${p}`;
-    for (const r of $$('.row.sel', box)) r.classList.remove('sel');
-    row.classList.add('sel');
-    if (area === 'conflict') openConflict(p);
-    else openDiff({ kind: 'work', area, ...entryOf(area, p) });
+    const key = keyOf(area, p);
+    if (ev.shiftKey && st.anchor) selectRange(st.anchor, key);
+    else if (isMod(ev)) { if (st.sel.has(key)) st.sel.delete(key); else st.sel.add(key); st.anchor = key; } else { st.sel = new Set([key]); st.anchor = key; }
+    st.selChange = key;
+    markSel();
+    if (!ev.shiftKey && !isMod(ev)) openEntry(area, p);
   });
   box.addEventListener('dblclick', (ev) => {
-    const row = ev.target.closest('.row');
-    if (!row || ev.target.closest('[data-ract]')) return;
+    const row = ev.target.closest('.row.f');
+    if (!row || ev.target.closest('[data-ract]') || ev.shiftKey || isMod(ev)) return;
     const { area, path: p } = row.dataset;
     if (area === 'unstaged' || area === 'untracked') onChangeAction('stage', area, p).catch(fail);
     else if (area === 'staged') onChangeAction('unstage', area, p).catch(fail);
   });
   box.addEventListener('contextmenu', (ev) => {
-    const row = ev.target.closest('.row');
+    const dr = ev.target.closest('.dirrow');
+    if (dr) {
+      const { area, dir } = dr.dataset;
+      const n = shown(area).filter((e) => e.path.startsWith(`${dir}/`)).length;
+      contextMenu(ev, [
+        { label: `${dir}/（${n} 個檔案）` },
+        area === 'unstaged' || area === 'untracked' ? ['暫存這個資料夾', () => onGroupAction('stage', area, dir)] : null,
+        area === 'staged' ? ['取消暫存這個資料夾', () => onGroupAction('unstage', area, dir)] : null,
+        ['複製路徑', () => copyText(dir)],
+        area === 'untracked' ? '-' : null,
+        ...(area === 'untracked' ? ignoreItems(dir, true) : []),
+        area === 'unstaged' || area === 'untracked' ? '-' : null,
+        area === 'unstaged' || area === 'untracked' ? [area === 'untracked' ? '刪除資料夾中的檔案…' : '捨棄這個資料夾的變更…', () => onGroupAction('discard', area, dir), { danger: true }] : null,
+      ]);
+      return;
+    }
+    const row = ev.target.closest('.row.f');
     if (!row) return;
     const { area, path: p } = row.dataset;
-    const e = entryOf(area, p);
-    const items = [];
-    if (area === 'conflict') items.push(['解決衝突', () => openConflict(p)]);
-    else items.push(['查看差異', () => openDiff({ kind: 'work', area, ...e }, { pin: true })]);
-    if (area === 'unstaged' || area === 'untracked') items.push(['暫存', () => onChangeAction('stage', area, p)]);
-    if (area === 'staged') items.push(['取消暫存', () => onChangeAction('unstage', area, p)]);
-    items.push('-');
-    if (e && e.status !== 'D') items.push(['開啟檔案', () => api('openFile', { path: p })]);
-    if (e && e.status !== 'D' && st.targets.length) items.push([targetLabel(), () => openInFlow({ file: p })]);
-    items.push(['複製相對路徑', () => copyText(p)]);
-    if (area === 'unstaged') items.push('-', ['捨棄變更…', () => onChangeAction('discard', area, p), { danger: true }]);
-    if (area === 'untracked') items.push('-', ['刪除檔案…', () => onChangeAction('discard', area, p), { danger: true }]);
-    contextMenu(ev, items);
+    const key = keyOf(area, p);
+    if (!st.sel.has(key)) { st.sel = new Set([key]); st.anchor = key; st.selChange = key; markSel(); }
+    const items = selectedItems();
+    contextMenu(ev, items.length > 1 ? multiMenu(items) : fileMenu(area, p));
   });
+  box.addEventListener('keydown', (ev) => {
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') { ev.preventDefault(); moveFocus(ev.key === 'ArrowDown' ? 1 : -1, ev.shiftKey); return; }
+    if (isMod(ev) && ev.key.toLowerCase() === 'a') { ev.preventDefault(); st.sel = new Set(rowKeys()); markSel(); return; }
+    if (ev.key === ' ' || ev.key === 'Enter') { ev.preventDefault(); const it = selectedItems(); if (it.length) batchAction('toggle', it).catch(fail); return; }
+    if (ev.key === 'Delete' || ev.key === 'Backspace') { ev.preventDefault(); const it = selectedItems(); if (it.length) batchAction('discard', it).catch(fail); return; }
+    if (ev.key === 'Escape') { st.sel.clear(); markSel(); }
+  });
+}
+
+/** 方向鍵移動焦點；extend 時延伸選取範圍 */
+function moveFocus(dir, extend) {
+  const keys = rowKeys();
+  if (!keys.length) return;
+  let i = keys.indexOf(st.selChange);
+  i = i < 0 ? (dir > 0 ? 0 : keys.length - 1) : Math.max(0, Math.min(keys.length - 1, i + dir));
+  const key = keys[i];
+  st.selChange = key;
+  if (extend && st.anchor) selectRange(st.anchor, key); else { st.sel = new Set([key]); st.anchor = key; }
+  markSel();
+  const row = $$('#changes .row.f')[i];
+  if (row) row.scrollIntoView({ block: 'nearest' });
+  if (!extend) { const [a, p] = splitKey(key); openEntry(a, p); }
 }
 
 /* ───────────── 提交 ───────────── */
@@ -893,12 +1170,16 @@ async function commitFlow() {
     await api('stageAll');
   }
   if (!amend && !msg.trim()) { notice('請輸入提交訊息', 'err'); $('#msg').focus(); return; }
+  let pushAfter = false;
   try {
-    const head = await api('commit', { message: msg, amend });
+    const o = st.commitOpts;
+    const head = await api('commit', { message: msg, amend, noVerify: o.noVerify, signoff: o.signoff });
+    rememberMsg(msg);
     $('#msg').value = '';
     $('#amend').checked = false;
     st.msgTouched = false;
     notice(`已提交：${head}`, 'ok');
+    pushAfter = o.push;
   } catch (err) {
     if (errInfo(err).code === 'NO_IDENTITY') {
       if (await identityFlow('還沒有設定提交者的名稱與 email，設定後才能提交。')) { await commitFlow(); return; }
@@ -908,6 +1189,7 @@ async function commitFlow() {
   } finally {
     await refreshAll();
   }
+  if (pushAfter) await pushFlow();
 }
 
 async function onAmendToggle() {
@@ -994,10 +1276,10 @@ async function withStash(title, fn) {
 
 /* ───────────── 遠端 ───────────── */
 
-async function fetchFlow() {
+async function fetchFlow(opts = {}) {
   try {
-    await api('fetch');
-    notice('已擷取最新的遠端提交', 'ok');
+    await api('fetch', opts);
+    notice(opts.pruneTags ? '已擷取，並刪除遠端已經不存在的標籤' : '已擷取最新的遠端提交', 'ok');
   } catch (err) {
     if (errInfo(err).code === 'NO_REMOTE') { if (await addRemoteFlow('這個儲存庫還沒有設定遠端。')) await fetchFlow(); return; }
     throw err;
@@ -1006,15 +1288,39 @@ async function fetchFlow() {
   }
 }
 
-async function pullFlow() {
+/** 拉取對話框（工具列的拉取）：選遠端分支與拉取方式 */
+async function pullDialog() {
+  const s = st.status;
+  if (!s) return;
+  if (!(s.remotes || []).length || s.detached) { await pullFlow(); return; }
+  const b = await ensureBranches();
+  const def = s.upstream || (b.remote.find((x) => x.name === `${defaultRemote()}/${s.branch}`) || {}).name || '';
+  if (!b.remote.length) { await pullFlow(); return; }
+  const v = await form({
+    title: '拉取',
+    desc: `把遠端分支的提交拉進目前分支 ${s.branch}${s.behind ? `（落後 ${s.behind} 個提交）` : ''}。`,
+    ok: '拉取',
+    fields: [
+      { name: 'ref', label: '遠端分支', type: 'select', value: def, options: [...(def ? [] : [['', '（選擇遠端分支）']]), ...b.remote.map((x) => [x.name, `${x.name}${x.name === s.upstream ? '（追蹤中）' : ''}`])] },
+      { name: 'mode', label: '拉取方式', type: 'select', value: store.get('pullMode', setting('pullMode', 'merge')), options: [['merge', '合併（merge）'], ['rebase', '重定基底（rebase，自動儲藏未提交的變更）'], ['ff-only', '只允許快轉（ff-only）']] },
+    ],
+    validate: (x) => (!x.ref ? '請選擇遠端分支' : ''),
+  });
+  if (!v) return;
+  store.set('pullMode', v.mode);
+  const rn = remoteOf(v.ref);
+  await pullFlow(v.ref === s.upstream ? { mode: v.mode } : { mode: v.mode, remote: rn, branch: v.ref.slice(rn.length + 1) });
+}
+
+async function pullFlow(opts = {}) {
   try {
-    const r = await withStash('拉取', () => api('pull'));
+    const r = await withStash('拉取', () => api('pull', opts));
     if (!r) return;
     if (r.conflict) { await onConflict(r); return; }
     notice(/Already up.to.date/i.test(r.output || '') ? '已經是最新的' : '已拉取遠端的提交', 'ok');
   } catch (err) {
     const e = errInfo(err);
-    if (e.code === 'NO_REMOTE') { if (await addRemoteFlow('這個儲存庫還沒有設定遠端。')) await pullFlow(); return; }
+    if (e.code === 'NO_REMOTE') { if (await addRemoteFlow('這個儲存庫還沒有設定遠端。')) await pullFlow(opts); return; }
     if (e.code === 'NO_UPSTREAM') {
       if (await confirmBox(e.message, '推送', { detail: '推送後會在遠端建立同名分支並設定追蹤，之後就能拉取。' })) await pushFlow();
       return;
@@ -1029,10 +1335,47 @@ async function pullFlow() {
   }
 }
 
+/** 遠端分支名稱（origin/main）所屬的遠端 */
+function remoteOf(ref) {
+  const names = ((st.status && st.status.remotes) || []).map((r) => r.name);
+  return names.filter((r) => String(ref || '').startsWith(`${r}/`)).sort((a, b) => b.length - a.length)[0] || '';
+}
+const defaultRemote = () => {
+  const rs = (st.status && st.status.remotes) || [];
+  return remoteOf(st.status && st.status.upstream) || ((rs.find((r) => r.name === 'origin') || rs[0]) || {}).name || '';
+};
+
+/** 推送對話框（工具列的推送）：選遠端、推送所有標籤、強制推送 */
+async function pushDialog() {
+  const s = st.status;
+  if (!s) return;
+  const remotes = s.remotes || [];
+  if (!remotes.length || s.detached || s.noCommits) { await pushFlow(); return; }
+  const def = defaultRemote();
+  const fields = [];
+  if (remotes.length > 1) fields.push({ name: 'remote', label: '推送到遠端', type: 'select', value: def, options: remotes.map((r) => [r.name, `${r.name}（${r.url}）`]) });
+  fields.push(
+    { name: 'tags', label: '同時推送所有標籤（git push --tags）', type: 'checkbox', value: store.get('pushTags', false) },
+    { name: 'force', label: '強制推送（--force-with-lease，覆蓋遠端的分支）', type: 'checkbox', value: false },
+  );
+  const target = s.upstream || `${def}/${s.branch}`;
+  const v = await form({
+    title: '推送',
+    desc: `把 ${s.branch} 推送到 ${target}${s.ahead ? `（${s.ahead} 個提交）` : s.upstream ? '（沒有新的提交）' : '（會在遠端建立這個分支並設定追蹤）'}`,
+    ok: '推送',
+    fields,
+  });
+  if (!v) return;
+  store.set('pushTags', v.tags);
+  if (v.force && !await confirmBox('確定要強制推送嗎？', '強制推送', { type: 'warning', detail: '遠端分支上本機沒有的提交會被移除，其他人的工作可能因此遺失。' })) return;
+  await pushFlow({ remote: v.remote || def, tags: v.tags, force: v.force });
+}
+
 async function pushFlow(opts = {}) {
   try {
     const r = await api('push', opts);
-    notice(r.created ? `已推送並建立遠端分支 ${r.upstream}` : `已推送到 ${r.upstream}`, 'ok');
+    const tags = r.tags ? '，也推送了所有標籤' : '';
+    notice(r.created ? `已推送並建立遠端分支 ${r.upstream}${tags}` : `已推送到 ${r.upstream}${tags}`, 'ok');
   } catch (err) {
     const e = errInfo(err);
     if (e.code === 'NO_REMOTE') { if (await addRemoteFlow('這個儲存庫還沒有設定遠端，請輸入要推送到的遠端網址。')) await pushFlow(opts); return; }
@@ -1074,6 +1417,111 @@ async function addRemoteFlow(desc = '') {
   return true;
 }
 
+/* ───────────── 標籤 ───────────── */
+
+/** 推送一個標籤；name 為空時推送全部標籤。remote 為空時多個遠端讓使用者選 */
+async function pushTagFlow(name, remote, { force = false } = {}) {
+  const rs = (st.status && st.status.remotes) || [];
+  if (!rs.length) { if (await addRemoteFlow('這個儲存庫還沒有設定遠端。')) await pushTagFlow(name, remote); return; }
+  const rn = remote || defaultRemote();
+  try {
+    await api('pushTag', { name, remote: rn, force });
+    if (st.remoteTags && st.remoteTags.remote === rn) {
+      if (name) st.remoteTags.set.add(name); else for (const t of (st.branches || { tags: [] }).tags) st.remoteTags.set.add(t.name);
+    }
+    notice(name ? `已把標籤 ${name} 推送到 ${rn}` : `已把所有標籤推送到 ${rn}`, 'ok');
+  } catch (err) {
+    if (errInfo(err).code !== 'REJECTED' || force || !name) throw err;
+    if (await confirmBox(`${rn} 已經有標籤 ${name}，而且指向不同的提交。要用本機的標籤取代嗎？`, '取代遠端標籤', { type: 'warning', detail: '其他人已經取得的舊標籤不會自動更新，建議改用新的標籤名稱。' })) await pushTagFlow(name, rn, { force: true });
+  }
+}
+
+async function pushAllTagsFlow(btn) {
+  const rs = (st.status && st.status.remotes) || [];
+  if (rs.length > 1) {
+    const items = [{ label: '推送所有標籤到' }, ...rs.map((r) => [r.name, () => pushTagFlow('', r.name)])];
+    if (btn) menuBelow(btn, items); else popup(items, innerWidth / 2, innerHeight / 3);
+    return;
+  }
+  await pushTagFlow('', rs[0] && rs[0].name);
+}
+
+/** 和遠端比對標籤：標示只在本機（還沒推送）與只在遠端的標籤 */
+async function compareRemoteTags(remote) {
+  const r = await api('remoteTags', { remote: remote || defaultRemote() });
+  st.remoteTags = { remote: r.remote, set: new Set(r.tags) };
+  const b = await ensureBranches();
+  const local = new Set(b.tags.map((t) => t.name));
+  const unpushed = b.tags.filter((t) => !st.remoteTags.set.has(t.name)).length;
+  const remoteOnly = r.tags.filter((t) => !local.has(t)).length;
+  notice(`${r.remote}：${unpushed} 個標籤還沒推送、${remoteOnly} 個只在遠端`, unpushed ? '' : 'ok');
+  setSide('branches');
+  renderBranches();
+}
+
+async function deleteTagFlow(name) {
+  const rs = (st.status && st.status.remotes) || [];
+  const rn = defaultRemote();
+  const c = rs.length
+    ? await choose(`刪除標籤 ${name}？`, ['只刪除本機', `本機與 ${rn} 都刪除`, '取消'], { type: 'warning', detail: `刪除 ${rn} 上的標籤後，其他人擷取時也看不到它（已經取得的人仍保留）。` })
+    : (await confirmBox(`刪除本機標籤 ${name}？`, '刪除', { type: 'warning' }) ? 0 : 2);
+  if (c === 2) return;
+  await api('deleteTag', { name });
+  if (c === 1) {
+    if (st.remoteTags) st.remoteTags.set.delete(name);
+    try { await api('deleteRemoteTag', { name, remote: rn }); } catch (err) {
+      if (errInfo(err).code !== 'NO_REF') throw err;
+      notice(`已刪除本機標籤；${rn} 上沒有這個標籤`);
+    }
+  }
+  notice(c === 1 ? `已刪除標籤 ${name}（本機與 ${rn}）` : `已刪除本機標籤 ${name}`, 'ok');
+  await refreshAll();
+}
+
+async function deleteRemoteTagFlow(name, rn) {
+  if (!await confirmBox(`從 ${rn} 刪除標籤 ${name}？`, '刪除', { type: 'warning', detail: '本機的標籤會保留。其他人擷取時不會再看到它，但已經取得的人仍保留。' })) return;
+  await api('deleteRemoteTag', { name, remote: rn });
+  if (st.remoteTags && st.remoteTags.remote === rn) st.remoteTags.set.delete(name);
+  notice(`已從 ${rn} 刪除標籤 ${name}`, 'ok');
+  await refreshAll();
+}
+
+async function createTagFlow(hash) {
+  const rs = (st.status && st.status.remotes) || [];
+  const rn = defaultRemote();
+  const fields = [{ name: 'name', label: '標籤名稱', placeholder: '例如：v1.0.0' }, { name: 'message', label: '說明（可省略；填寫時建立附註標籤）', type: 'textarea', rows: 2 }];
+  if (rs.length) fields.push({ name: 'push', label: `建立後推送到 ${rn}`, type: 'checkbox', value: store.get('tagPush', false) });
+  const v = await form({
+    title: `在 ${hash ? hash.slice(0, 7) : '目前的提交'} 建立標籤`,
+    ok: '建立',
+    fields,
+    validate: (x) => (!x.name.trim() ? '請輸入標籤名稱' : /\s/.test(x.name.trim()) ? '標籤名稱不能有空白' : ''),
+  });
+  if (!v) return;
+  const name = v.name.trim();
+  await api('createTag', { name, at: hash || undefined, message: v.message });
+  if (rs.length) store.set('tagPush', !!v.push);
+  if (v.push) await pushTagFlow(name, rn);
+  else notice(`已建立標籤 ${name}（在「分支」分頁右鍵標籤可以推送）`, 'ok');
+  await refreshAll();
+}
+
+function tagItems(name, hash) {
+  const rs = (st.status && st.status.remotes) || [];
+  return [
+    hash ? ['切換到這個標籤（分離的 HEAD）', () => checkoutFlow({ commit: hash }, name)] : null,
+    ['從這裡建立分支…', () => newBranchFlow(`refs/tags/${name}`, name)],
+    ['在線圖中顯示', () => revealRef('tag', name)],
+    ['複製名稱', () => copyText(name)],
+    '-',
+    ...rs.map((r) => [`推送到 ${r.name}`, () => pushTagFlow(name, r.name)]),
+    ...rs.map((r) => [`推送所有標籤到 ${r.name}`, () => pushTagFlow('', r.name)]),
+    '-',
+    ['刪除標籤…', () => deleteTagFlow(name), { danger: true }],
+    ...rs.map((r) => [`只從 ${r.name} 刪除…`, () => deleteRemoteTagFlow(name, r.name), { danger: true }]),
+  ];
+}
+
 /* ───────────── 分支 ───────────── */
 
 async function ensureBranches() {
@@ -1082,7 +1530,8 @@ async function ensureBranches() {
 }
 
 async function loadBranches() {
-  st.branches = await api('branches');
+  const [b] = await Promise.all([api('branches'), loadExtras()]);
+  st.branches = b;
   renderBranches();
 }
 
@@ -1163,133 +1612,208 @@ function renderBranches() {
   const box = $('#branches');
   if (!b) { box.innerHTML = '<div class="empty-msg">讀取中…</div>'; return; }
   const s = st.status || {};
+  const q = st.brFilter.trim().toLowerCase();
+  const hit = (n) => !q || n.toLowerCase().includes(q);
   const out = [];
   const grp = (key, title, n, acts = '') => {
-    const closed = st.collapsed.has(key);
+    if (q && !n) return false;
+    const closed = st.collapsed.has(key) && !q;
     out.push(`<div class="grp-h" data-grp="${key}"><span class="tw">${closed ? '▸' : '▾'}</span>${title}<span class="n">${n}</span><span class="acts">${acts}</span></div>`);
     return !closed;
   };
-  if (grp('b:local', '本機分支', b.local.length, '<button class="ib sm" data-bact="new" title="建立分支">＋</button>')) {
-    for (const x of b.local) {
-      const ab = [x.ahead ? `↑${x.ahead}` : '', x.behind ? `↓${x.behind}` : '', x.gone ? '遠端已刪除' : ''].filter(Boolean).join(' ');
-      out.push(`<div class="row${x.current ? ' cur' : ''}" data-kind="local" data-name="${esc(x.name)}" title="${esc(`${x.name}${x.upstream ? `\n追蹤 ${x.upstream}` : '\n沒有追蹤的遠端分支'}\n${x.hash} ${x.subject}\n雙擊切換`)}">`
-        + `<span class="ic">${x.current ? '●' : '⎇'}</span><span class="nm">${esc(x.name)}</span><span class="meta">${esc(ab)}</span></div>`);
+  const label = (name) => (q ? name : basename(name));
+  const localRow = (x, depth) => {
+    const ab = [x.ahead ? `↑${x.ahead}` : '', x.behind ? `↓${x.behind}` : '', x.gone ? '遠端已刪除' : ''].filter(Boolean).join(' ');
+    return `<div class="row${x.current ? ' cur' : ''}" data-kind="local" data-name="${esc(x.name)}" style="padding-left:${10 + depth * 14}px" title="${esc(`${x.name}${x.upstream ? `\n追蹤 ${x.upstream}` : '\n沒有追蹤的遠端分支'}\n${x.hash} ${x.subject}\n雙擊切換`)}">`
+      + `<span class="ic">${x.current ? '●' : '⎇'}</span><span class="nm">${esc(label(x.name))}</span><span class="meta">${esc(ab)}</span></div>`;
+  };
+  const remoteRow = (x, depth) => `<div class="row" data-kind="remote" data-name="${esc(x.name)}" style="padding-left:${10 + depth * 14}px" title="${esc(`${x.name}\n${x.hash} ${x.subject}\n雙擊建立本機分支並切換`)}"><span class="ic">☁</span><span class="nm">${esc(label(x.name))}</span><span class="meta">${esc(C.ago(x.time))}</span></div>`;
+  const count = (n) => n.items.length + n.dirs.reduce((t, c) => t + count(c), 0);
+  /** 依「/」分資料夾；篩選時改成平面清單 */
+  const tree = (kind, list, rowFn) => {
+    if (q) { for (const x of list.filter((y) => hit(y.name))) out.push(rowFn(x, 0)); return; }
+    const walk = (node, depth) => {
+      for (const d of node.dirs) {
+        const k = `bf:${kind}:${d.path}`;
+        const closed = st.collapsed.has(k);
+        out.push(`<div class="row bdir" data-fold="${esc(k)}" style="padding-left:${2 + depth * 14}px" title="${esc(d.path)}/"><span class="tw">${closed ? '▸' : '▾'}</span><span class="ic">📁</span><span class="nm">${esc(d.name)}</span><span class="meta">${count(d)}</span></div>`);
+        if (!closed) walk(d, depth + 1);
+      }
+      for (const x of node.items) out.push(rowFn(x, depth));
+    };
+    walk(C.buildTree(list, (x) => x.name), 0);
+  };
+  const locals = b.local.filter((x) => hit(x.name));
+  if (grp('b:local', '本機分支', locals.length, '<button class="ib sm" data-bact="new" title="建立分支">＋</button>')) tree('local', b.local, localRow);
+  const remotes = b.remote.filter((x) => hit(x.name));
+  if (b.remote.length && grp('b:remote', '遠端分支', remotes.length, '<button class="ib sm" data-bact="fetch" title="擷取">⟳</button>')) tree('remote', b.remote, remoteRow);
+  const tags = b.tags.filter((x) => hit(x.name));
+  const rt = st.remoteTags && (s.remotes || []).some((r) => r.name === st.remoteTags.remote) ? st.remoteTags : null;
+  const localTags = new Set(b.tags.map((x) => x.name));
+  const remoteOnly = rt ? [...rt.set].filter((n) => !localTags.has(n) && hit(n)) : [];
+  const hasRemote = (s.remotes || []).length;
+  const tagActs = `${hasRemote ? '<button class="ib sm" data-bact="cmpTags" title="和遠端比對，標示還沒推送的標籤（需要連線）">⇄</button><button class="ib sm" data-bact="pushTags" data-menu title="推送所有標籤">⇡</button>' : ''}<button class="ib sm" data-bact="newTag" title="在目前的提交建立標籤">＋</button>`;
+  if (grp('b:tags', '標籤', tags.length + remoteOnly.length, tagActs)) {
+    if (!b.tags.length && !remoteOnly.length && !q) out.push('<div class="empty-msg">還沒有標籤。在線圖右鍵提交，或按上面的「＋」建立。</div>');
+    for (const x of tags) {
+      const un = rt && !rt.set.has(x.name);
+      out.push(`<div class="row" data-kind="tag" data-name="${esc(x.name)}" title="${esc(`${x.name}\n${x.hash} ${x.subject}${un ? `\n還沒推送到 ${rt.remote}` : ''}`)}"><span class="ic">🏷</span><span class="nm">${esc(x.name)}</span>${un ? '<span class="pill">未推送</span>' : ''}<span class="meta">${esc(x.hash)}</span></div>`);
     }
+    for (const n of remoteOnly) out.push(`<div class="row" data-kind="rtag" data-name="${esc(n)}" title="${esc(`${n}\n只在 ${rt.remote}，本機沒有（擷取後會出現）`)}"><span class="ic">☁</span><span class="nm">${esc(n)}</span><span class="pill dim">只在遠端</span></div>`);
   }
-  if (b.remote.length && grp('b:remote', '遠端分支', b.remote.length, '<button class="ib sm" data-bact="fetch" title="擷取">⟳</button>')) {
-    for (const x of b.remote) {
-      out.push(`<div class="row" data-kind="remote" data-name="${esc(x.name)}" title="${esc(`${x.name}\n${x.hash} ${x.subject}\n雙擊建立本機分支並切換`)}"><span class="ic">☁</span><span class="nm">${esc(x.name)}</span><span class="meta">${esc(C.ago(x.time))}</span></div>`);
-    }
+  const subs = (st.subs || []).filter((x) => hit(x.path));
+  if (subs.length && grp('b:subs', '子模組', subs.length, '<button class="ib sm" data-bact="subUpdate" title="初始化並更新所有子模組（submodule update --init --recursive）">⟳</button>')) {
+    const SUB = { ok: ['◆', ''], uninit: ['◇', '尚未初始化'], changed: ['◆', '指向的提交不同'], conflict: ['!', '衝突'] };
+    for (const x of subs) out.push(`<div class="row" data-kind="sub" data-name="${esc(x.path)}" title="${esc(`${x.path}\n${x.hash.slice(0, 10)}${x.describe ? `（${x.describe}）` : ''}${SUB[x.state][1] ? `\n${SUB[x.state][1]}` : ''}`)}"><span class="ic">${SUB[x.state][0]}</span><span class="nm">${esc(x.path)}</span>${SUB[x.state][1] ? `<span class="pill${x.state === 'uninit' ? ' dim' : ''}">${SUB[x.state][1]}</span>` : ''}<span class="meta">${esc(x.hash.slice(0, 7))}</span></div>`);
   }
-  if (b.tags.length && grp('b:tags', '標籤', b.tags.length)) {
-    for (const x of b.tags) out.push(`<div class="row" data-kind="tag" data-name="${esc(x.name)}" title="${esc(`${x.name}\n${x.hash} ${x.subject}`)}"><span class="ic">🏷</span><span class="nm">${esc(x.name)}</span><span class="meta">${esc(x.hash)}</span></div>`);
+  const wts = (st.worktrees || []).filter((x) => hit(x.path) || hit(x.branch || ''));
+  if (!q && (st.worktrees || []).length > 1 && grp('b:wts', '工作樹', wts.length, '<button class="ib sm" data-bact="wtAdd" title="新增工作樹">＋</button>')) {
+    for (const w of wts) out.push(`<div class="row${w.current ? ' cur' : ''}" data-kind="wt" data-name="${esc(w.path)}" title="${esc(`${w.path}${w.main ? '\n主要的工作樹' : ''}${w.current ? '\n目前開啟的' : '\n雙擊開啟'}`)}"><span class="ic">${w.current ? '●' : '▣'}</span><span class="nm">${esc(w.branch || (w.detached ? `（分離）${(w.hash || '').slice(0, 7)}` : basename(w.path)))}</span><span class="dir">${esc(w.path)}</span></div>`);
   }
-  const remotes = s.remotes || [];
-  if (grp('b:remotes', '遠端', remotes.length, '<button class="ib sm" data-bact="addRemote" title="新增遠端">＋</button>')) {
-    if (!remotes.length) out.push('<div class="empty-msg">還沒有設定遠端。<br><button class="secondary sm" data-bact="addRemote">＋ 新增遠端…</button></div>');
-    for (const r of remotes) out.push(`<div class="row" data-kind="remoteRepo" data-name="${esc(r.name)}" title="${esc(r.url)}"><span class="ic">⇅</span><span class="nm">${esc(r.name)}</span><span class="dir">${esc(r.url)}</span></div>`);
+  const rlist = s.remotes || [];
+  if (!q && grp('b:remotes', '遠端', rlist.length, '<button class="ib sm" data-bact="addRemote" title="新增遠端">＋</button>')) {
+    if (!rlist.length) out.push('<div class="empty-msg">還沒有設定遠端。<br><button class="secondary sm" data-bact="addRemote">＋ 新增遠端…</button></div>');
+    for (const r of rlist) out.push(`<div class="row" data-kind="remoteRepo" data-name="${esc(r.name)}" title="${esc(r.url)}"><span class="ic">⇅</span><span class="nm">${esc(r.name)}</span><span class="dir">${esc(r.url)}</span></div>`);
   }
+  if (q && !locals.length && !remotes.length && !tags.length) out.push('<div class="empty-msg">沒有符合篩選的分支或標籤。</div>');
   box.innerHTML = out.join('');
+}
+
+/** 分支、遠端分支、標籤、遠端的右鍵選單（側欄與線圖上的標記共用） */
+function refItems(kind, name, { hash = '' } = {}) {
+  const b = st.branches || { local: [], remote: [], tags: [] };
+  const cur = st.status && st.status.branch;
+  if (kind === 'local') {
+    const x = b.local.find((y) => y.name === name);
+    const isCur = name === cur;
+    return [
+      ['切換到這個分支', () => checkoutFlow({ branch: name }, name), { disabled: isCur }],
+      [`合併到目前分支（${cur || 'HEAD'}）`, () => mergeFlow(name), { disabled: isCur }],
+      [`把目前分支重定基底到 ${name}…`, () => rebaseOntoFlow(name), { disabled: isCur || !cur }],
+      ['與目前分支比較', () => compareRangeFlow({ hash: st.status.head.hash, label: cur || 'HEAD' }, { hash: x.hash, label: name }), { disabled: isCur || !x || !(st.status && st.status.head) }],
+      ['從這裡建立分支…', () => newBranchFlow(name)],
+      ['在線圖中顯示', () => revealRef(kind, name)],
+      '-',
+      isCur ? ['推送…', () => pushDialog()] : null,
+      ['重新命名…', async () => {
+        const n = await ask(`重新命名分支 ${name}`, name, { validate: (v) => (!v.trim() ? '名稱不能是空的' : /\s/.test(v.trim()) ? '分支名稱不能有空白' : '') });
+        if (n && n !== name) { await api('renameBranch', { from: name, to: n }); await refreshAll(); }
+      }],
+      ['複製名稱', () => copyText(name)],
+      x && x.upstream ? ['複製追蹤的遠端分支名稱', () => copyText(x.upstream)] : null,
+      '-',
+      ['刪除分支…', () => deleteBranchFlow(name), { danger: true, disabled: isCur }],
+    ];
+  }
+  if (kind === 'remote') {
+    return [
+      ['切換（建立本機分支並追蹤）', () => checkoutFlow({ remote: name }, name)],
+      [`合併到目前分支（${cur || 'HEAD'}）`, () => mergeFlow(name)],
+      [`把目前分支重定基底到 ${name}…`, () => rebaseOntoFlow(name), { disabled: !cur }],
+      ['與目前分支比較', () => compareRangeFlow({ hash: st.status.head.hash, label: cur || 'HEAD' }, { hash: (b.remote.find((z) => z.name === name) || {}).hash, label: name }), { disabled: !(st.status && st.status.head) }],
+      ['從這裡建立分支…', () => newBranchFlow(name)],
+      ['在線圖中顯示', () => revealRef(kind, name)],
+      ['複製名稱', () => copyText(name)],
+      '-',
+      ['刪除遠端分支…', async () => {
+        if (!await confirmBox(`刪除遠端的分支 ${name}？`, '刪除', { type: 'warning', detail: '會從遠端伺服器上刪除，其他人也會看不到這個分支。' })) return;
+        await api('deleteRemoteBranch', { remote: name });
+        notice(`已刪除遠端分支 ${name}`, 'ok');
+        await refreshAll();
+      }, { danger: true }],
+    ];
+  }
+  if (kind === 'tag') {
+    const t = b.tags.find((y) => y.name === name);
+    return tagItems(name, hash || (t && t.hash));
+  }
+  if (kind === 'sub') {
+    const x = (st.subs || []).find((y) => y.path === name) || {};
+    return [
+      [x.state === 'uninit' ? '初始化並下載' : '更新到記錄的版本', () => submoduleUpdateFlow(name)],
+      x.state !== 'uninit' ? ['開啟這個子模組', () => openRepoAt(`${repo().root}/${name}`, basename(name))] : null,
+      ['複製路徑', () => copyText(name)],
+    ];
+  }
+  if (kind === 'wt') {
+    const w = (st.worktrees || []).find((y) => y.path === name) || {};
+    return [
+      ['開啟這個工作樹', () => openRepoAt(name, basename(name)), { disabled: w.current }],
+      ['在檔案管理員中顯示', () => td.shell.showItemInFolder(name)],
+      ['複製路徑', () => copyText(name)],
+      '-',
+      ['移除工作樹…', () => removeWorktreeFlow(w), { danger: true, disabled: w.main || w.current }],
+    ];
+  }
+  if (kind === 'rtag') {
+    const rn = st.remoteTags ? st.remoteTags.remote : defaultRemote();
+    return [
+      ['擷取（取得遠端的標籤）', () => fetchFlow()],
+      ['複製名稱', () => copyText(name)],
+      '-',
+      [`從 ${rn} 刪除這個標籤…`, () => deleteRemoteTagFlow(name, rn), { danger: true }],
+    ];
+  }
+  if (kind === 'remoteRepo') {
+    const r = st.status.remotes.find((y) => y.name === name);
+    return [
+      ['複製網址', () => copyText(r.url)],
+      ['擷取', () => fetchFlow()],
+      ['擷取並刪除遠端已不存在的標籤…', async () => {
+        if (await confirmBox('擷取並刪除本機上、遠端已經不存在的標籤？', '擷取並清除', { detail: '只在本機、還沒推送的標籤也會被刪除。要保留的請先推送。' })) await fetchFlow({ pruneTags: true });
+      }],
+      ['推送所有標籤到這裡', () => pushTagFlow('', name)],
+      ['比對遠端標籤', () => compareRemoteTags(name)],
+      '-',
+      ['移除遠端…', async () => {
+        if (!await confirmBox(`移除遠端 ${name}？`, '移除', { type: 'warning', detail: '只會移除本機的設定與遠端分支的紀錄，不會影響遠端伺服器上的儲存庫。' })) return;
+        await api('removeRemote', { name });
+        await refreshAll();
+      }, { danger: true }],
+    ];
+  }
+  return [];
 }
 
 function initBranches() {
   const box = $('#branches');
+  $('#brFilter').addEventListener('input', (e) => { st.brFilter = e.target.value; renderBranches(); });
   box.addEventListener('click', (ev) => {
     const a = ev.target.closest('[data-bact]');
     if (a) {
       ev.stopPropagation();
-      const act = a.dataset.bact;
-      (act === 'new' ? newBranchFlow() : act === 'fetch' ? fetchFlow() : addRemoteFlow()).catch(fail);
+      const fn = { new: () => newBranchFlow(), fetch: () => fetchFlow(), cmpTags: () => compareRemoteTags(), subUpdate: () => submoduleUpdateFlow(), wtAdd: () => addWorktreeFlow(), pushTags: () => pushAllTagsFlow(a), newTag: () => createTagFlow(''), addRemote: () => addRemoteFlow() }[a.dataset.bact];
+      if (fn) Promise.resolve(fn()).catch(fail);
       return;
     }
     const h = ev.target.closest('.grp-h');
-    if (h) {
-      const k = h.dataset.grp;
+    const f = ev.target.closest('.bdir');
+    if (h || f) {
+      const k = h ? h.dataset.grp : f.dataset.fold;
       if (st.collapsed.has(k)) st.collapsed.delete(k); else st.collapsed.add(k);
       renderBranches();
       return;
     }
-    const row = ev.target.closest('.row');
+    const row = ev.target.closest('.row[data-kind]');
     if (!row) return;
     for (const r of $$('.row.sel', box)) r.classList.remove('sel');
     row.classList.add('sel');
     const { kind, name } = row.dataset;
-    if (kind !== 'remoteRepo') revealRef(kind, name);
+    if (kind === 'local' || kind === 'remote' || kind === 'tag') revealRef(kind, name);
   });
   box.addEventListener('dblclick', (ev) => {
-    const row = ev.target.closest('.row');
+    const row = ev.target.closest('.row[data-kind]');
     if (!row) return;
     const { kind, name } = row.dataset;
     if (kind === 'local' && !row.classList.contains('cur')) checkoutFlow({ branch: name }, name).catch(fail);
     else if (kind === 'remote') checkoutFlow({ remote: name }, name).catch(fail);
+    else if (kind === 'wt' && !row.classList.contains('cur')) openRepoAt(name, basename(name)).catch(fail);
+    else if (kind === 'sub') openRepoAt(`${repo().root}/${name}`, basename(name)).catch(fail);
   });
   box.addEventListener('contextmenu', (ev) => {
-    const row = ev.target.closest('.row');
+    const row = ev.target.closest('.row[data-kind]');
     if (!row) return;
-    const { kind, name } = row.dataset;
-    const cur = row.classList.contains('cur');
-    const b = st.branches;
-    let items = [];
-    if (kind === 'local') {
-      const x = b.local.find((y) => y.name === name);
-      items = [
-        ['切換到這個分支', () => checkoutFlow({ branch: name }, name), { disabled: cur }],
-        [`合併到目前分支（${st.status.branch || 'HEAD'}）`, () => mergeFlow(name), { disabled: cur }],
-        ['從這裡建立分支…', () => newBranchFlow(name)],
-        ['在線圖中顯示', () => revealRef(kind, name)],
-        '-',
-        cur ? ['推送', () => pushFlow()] : null,
-        ['重新命名…', async () => {
-          const n = await ask(`重新命名分支 ${name}`, name, { validate: (v) => (!v.trim() ? '名稱不能是空的' : /\s/.test(v.trim()) ? '分支名稱不能有空白' : '') });
-          if (n && n !== name) { await api('renameBranch', { from: name, to: n }); await refreshAll(); }
-        }],
-        ['複製名稱', () => copyText(name)],
-        x && x.upstream ? ['複製追蹤的遠端分支名稱', () => copyText(x.upstream)] : null,
-        '-',
-        ['刪除分支…', () => deleteBranchFlow(name), { danger: true, disabled: cur }],
-      ];
-    } else if (kind === 'remote') {
-      items = [
-        ['切換（建立本機分支並追蹤）', () => checkoutFlow({ remote: name }, name)],
-        [`合併到目前分支（${st.status.branch || 'HEAD'}）`, () => mergeFlow(name)],
-        ['從這裡建立分支…', () => newBranchFlow(name)],
-        ['在線圖中顯示', () => revealRef(kind, name)],
-        ['複製名稱', () => copyText(name)],
-        '-',
-        ['刪除遠端分支…', async () => {
-          if (!await confirmBox(`刪除遠端的分支 ${name}？`, '刪除', { type: 'warning', detail: '會從遠端伺服器上刪除，其他人也會看不到這個分支。' })) return;
-          await api('deleteRemoteBranch', { remote: name });
-          notice(`已刪除遠端分支 ${name}`, 'ok');
-          await refreshAll();
-        }, { danger: true }],
-      ];
-    } else if (kind === 'tag') {
-      items = [
-        ['切換到這個標籤（分離的 HEAD）', () => checkoutFlow({ commit: b.tags.find((y) => y.name === name).hash }, name)],
-        ['從這裡建立分支…', () => newBranchFlow(`refs/tags/${name}`, name)],
-        ['在線圖中顯示', () => revealRef(kind, name)],
-        ['複製名稱', () => copyText(name)],
-        '-',
-        ['刪除標籤…', async () => {
-          if (!await confirmBox(`刪除本機標籤 ${name}？`, '刪除', { type: 'warning' })) return;
-          await api('deleteTag', { name });
-          await refreshAll();
-        }, { danger: true }],
-      ];
-    } else if (kind === 'remoteRepo') {
-      const r = st.status.remotes.find((y) => y.name === name);
-      items = [
-        ['複製網址', () => copyText(r.url)],
-        ['擷取', () => fetchFlow()],
-        '-',
-        ['移除遠端…', async () => {
-          if (!await confirmBox(`移除遠端 ${name}？`, '移除', { type: 'warning', detail: '只會移除本機的設定與遠端分支的紀錄，不會影響遠端伺服器上的儲存庫。' })) return;
-          await api('removeRemote', { name });
-          await refreshAll();
-        }, { danger: true }],
-      ];
-    }
-    contextMenu(ev, items);
+    contextMenu(ev, refItems(row.dataset.kind, row.dataset.name));
   });
 }
 
@@ -1449,7 +1973,7 @@ function initTabs() {
 async function loadLog({ more = false } = {}) {
   const limit = Math.max(50, Number(setting('logLimit', 300)) || 300);
   st.logLimit = more ? st.logLimit + limit : Math.max(st.logLimit, limit);
-  const r = await api('log', { limit: st.logLimit, all: st.graphAll });
+  const r = await api('log', { limit: st.logLimit, all: st.graphAll, search: st.search || undefined });
   st.log = r;
   const g = graphTab();
   if (g) g.view.render();
@@ -1460,7 +1984,9 @@ class GraphView {
     this.el = document.createElement('div');
     this.el.className = 'view graph';
     this.el.innerHTML = '<div class="ghead"><label class="chk" title="顯示所有分支，或只顯示目前分支的歷史"><input type="checkbox" class="all"> 所有分支</label>'
-      + '<span class="cnt"></span><span class="sp"></span><input type="search" class="q" placeholder="搜尋訊息、作者、提交編號" spellcheck="false"></div>'
+      + '<span class="cnt"></span><span class="sp"></span>'
+      + '<select class="qm" title="搜尋方式"><option value="">篩選已載入的提交</option><option value="message">搜尋全部歷史的訊息</option><option value="author">搜尋全部歷史的作者</option><option value="content">搜尋檔案內容的變更（-S）</option></select>'
+      + '<input type="search" class="q" placeholder="搜尋訊息、作者、提交編號" spellcheck="false"></div>'
       + '<div class="gsplit"><div class="glist" tabindex="0"></div><div class="dsplit" hidden></div><div class="detail" hidden></div></div>';
     this.list = $('.glist', this.el);
     this.detail = $('.detail', this.el);
@@ -1468,7 +1994,17 @@ class GraphView {
     this.detailHash = '';
     $('.all', this.el).checked = st.graphAll;
     $('.all', this.el).onchange = (e) => { st.graphAll = e.target.checked; store.set('graphAll', st.graphAll); loadLog().catch(fail); };
-    $('.q', this.el).oninput = () => this.applyFilter();
+    $('.q', this.el).oninput = () => {
+      if (!$('.qm', this.el).value) { this.applyFilter(); return; }
+      // 在 git 端搜尋：清空時回到完整的線圖
+      if (!$('.q', this.el).value.trim() && st.search) { st.search = null; loadLog().catch(fail); }
+    };
+    $('.q', this.el).onkeydown = (e) => { if (e.key === 'Enter' && $('.qm', this.el).value) this.runSearch(); };
+    $('.qm', this.el).onchange = () => {
+      const m = $('.qm', this.el).value;
+      $('.q', this.el).placeholder = m ? { message: '輸入後按 Enter 搜尋提交訊息', author: '輸入後按 Enter 搜尋作者名稱或 email', content: '輸入後按 Enter：找出新增或刪除這段文字的提交' }[m] : '搜尋訊息、作者、提交編號';
+      if (!m) { if (st.search) { st.search = null; loadLog().catch(fail); } this.applyFilter(); } else if ($('.q', this.el).value.trim()) this.runSearch();
+    };
     this.list.addEventListener('click', (e) => {
       const more = e.target.closest('[data-more]');
       if (more) { loadLog({ more: true }).catch(fail); return; }
@@ -1478,8 +2014,22 @@ class GraphView {
     this.list.addEventListener('contextmenu', (e) => {
       const row = e.target.closest('.crow');
       if (!row) return;
+      const c = st.log.commits[Number(row.dataset.i)];
       this.select(Number(row.dataset.i));
-      contextMenu(e, commitMenu(st.log.commits[Number(row.dataset.i)]));
+      // 在分支或標籤的標記上右鍵：那個參照的選單
+      const ref = e.target.closest('.ref[data-ref]');
+      if (ref) {
+        const [type, ...rest] = ref.dataset.ref.split(':');
+        const name = rest.join(':');
+        if (type === 'local' || type === 'remote' || type === 'tag') {
+          e.preventDefault();
+          e.stopPropagation();
+          const x = e.clientX, y = e.clientY;
+          ensureBranches().then(() => popup([{ label: `${type === 'tag' ? '標籤' : type === 'remote' ? '遠端分支' : '分支'} ${name}` }, ...refItems(type, name, { hash: c.hash })], x, y)).catch(fail);
+          return;
+        }
+      }
+      contextMenu(e, commitMenu(c));
     });
     this.list.addEventListener('keydown', (e) => {
       if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
@@ -1579,7 +2129,15 @@ class GraphView {
     }
   }
 
+  runSearch() {
+    const text = $('.q', this.el).value.trim();
+    st.search = text ? { mode: $('.qm', this.el).value, text } : null;
+    for (const r of $$('.crow.dim', this.list)) r.classList.toggle('dim', false);
+    loadLog().then(() => { if (st.search) notice(`找到 ${st.log.commits.length}${st.log.more ? '+' : ''} 個符合的提交`); }).catch(fail);
+  }
+
   applyFilter() {
+    if (st.search) { $('.cnt', this.el).textContent = `搜尋結果：${st.log ? st.log.commits.length : 0}${st.log && st.log.more ? '+' : ''} 個提交`; return; }
     const q = $('.q', this.el).value.trim().toLowerCase();
     const commits = st.log ? st.log.commits : [];
     let hits = 0;
@@ -1664,21 +2222,19 @@ function commitMenu(c) {
   const cur = s.branch;
   const items = [
     ['複製提交編號', () => copyText(c.hash)],
+    ['複製短編號', () => copyText(c.hash.slice(0, 7))],
     ['複製訊息', () => copyText(c.subject)],
     '-',
-    ['從這裡建立分支…', () => newBranchFlow(c.hash, c.hash.slice(0, 7))],
-    ['建立標籤…', async () => {
-      const v = await form({
-        title: `在 ${c.hash.slice(0, 7)} 建立標籤`,
-        ok: '建立',
-        fields: [{ name: 'name', label: '標籤名稱', placeholder: '例如：v1.0.0' }, { name: 'message', label: '說明（可省略；填寫時建立附註標籤）', type: 'textarea', rows: 2 }],
-        validate: (x) => (!x.name.trim() ? '請輸入標籤名稱' : /\s/.test(x.name.trim()) ? '標籤名稱不能有空白' : ''),
-      });
-      if (!v) return;
-      await api('createTag', { name: v.name.trim(), at: c.hash, message: v.message });
-      notice(`已建立標籤 ${v.name.trim()}（推送時會一併推送）`, 'ok');
-      await refreshAll();
+    ['與工作目錄比較', () => compareWorkingFlow(c)],
+    st.cmpBase && st.cmpBase.hash !== c.hash ? [`與 ${st.cmpBase.label} 比較`, () => compareRangeFlow(st.cmpBase, { hash: c.hash, label: c.hash.slice(0, 7) })] : null,
+    ['設為比較的起點', () => { st.cmpBase = { hash: c.hash, label: c.hash.slice(0, 7) }; notice(`已把 ${c.hash.slice(0, 7)} 設為比較的起點，再右鍵另一個提交選「與 ${c.hash.slice(0, 7)} 比較」`); }],
+    ['存成 Patch…', async () => {
+      const r = await api('savePatch', { hash: c.hash, subject: c.subject });
+      if (r) notice(`已存成 ${r.filePath}`, 'ok');
     }],
+    '-',
+    ['從這裡建立分支…', () => newBranchFlow(c.hash, c.hash.slice(0, 7))],
+    ['建立標籤…', () => createTagFlow(c.hash)],
   ];
   const locals = c.refs.filter((r) => r.type === 'local' && !r.head);
   const remotes = c.refs.filter((r) => r.type === 'remote');
@@ -1707,13 +2263,32 @@ function commitMenu(c) {
       await refreshAll();
     }, { disabled: c.parents.length > 1 }]);
   }
+  if (!s.state) items.push(['修改提交訊息…', () => rewordFlow(c), { disabled: c.parents.length !== 1 && !(s.head && s.head.hash === c.hash) }]);
   if (cur && !s.state && s.head && c.hash !== s.head.hash) {
+    items.push('-',
+      [`把 ${cur} 重定基底到這裡（rebase）…`, () => rebaseOntoFlow(c.hash, c.hash.slice(0, 7))],
+      [`互動式重定基底 ${cur} 到這裡…`, () => interactiveRebaseFlow(c)]);
     items.push('-', { label: `把 ${cur} 重設到這個提交` },
       ['　保留變更並暫存（soft）', () => resetFlow(c, 'soft')],
       ['　保留變更、不暫存（mixed）', () => resetFlow(c, 'mixed')],
       ['　捨棄所有變更（hard）…', () => resetFlow(c, 'hard'), { danger: true }]);
   }
   return items;
+}
+
+/** 提交與目前工作目錄的差異（Fork 的 Compare to Local Changes） */
+async function compareWorkingFlow(c) {
+  const files = await api('compare:files', { hash: c.hash });
+  const g = graphTab();
+  activate(g.id);
+  const short = c.hash.slice(0, 7);
+  g.view.showDetail({
+    title: `${short} ↔ 工作目錄`,
+    message: `${c.subject}\n\n比較這個提交與目前工作目錄中的檔案（包含還沒提交的變更，不含未追蹤的檔案）。`,
+    rows: [['提交', `<span class="mono">${esc(c.hash)}</span>`, true]],
+    files,
+    openFile: (f) => openDiff({ kind: 'cmp', hash: c.hash, path: f.path, orig: f.orig, status: f.status, label: f.label, title: `${basename(f.path)}（${short} ↔ 工作目錄）` }),
+  });
 }
 
 async function resetFlow(c, mode) {
@@ -1727,66 +2302,326 @@ async function resetFlow(c, mode) {
   await refreshAll();
 }
 
+/* ───────────── 重定基底 ───────────── */
+
+/** 把目前分支重定基底到 onto（分支或提交） */
+async function rebaseOntoFlow(onto, label) {
+  const cur = st.status.branch;
+  if (!cur) { notice('目前不在任何分支上，無法重定基底', 'err'); return; }
+  if (!await confirmBox(`把 ${cur} 重定基底到 ${label || onto}？`, '重定基底', { detail: `${cur} 上自己的提交會依序重新套用在 ${label || onto} 之後，歷史會變成一直線。已經推送過的提交重定基底後需要強制推送。有衝突時會停下來讓你逐一解決，也可以中止。` })) return;
+  const r = await withStash('重定基底', () => api('rebase', { onto }));
+  if (r && r.conflict) { await onConflict(r); return; }
+  if (r) notice(`已把 ${cur} 重定基底到 ${label || onto}`, 'ok');
+  await refreshAll();
+}
+
+/** 修改提交訊息（Fork 的 Edit Commit Message） */
+async function rewordFlow(c) {
+  const info = await api('commit:info', { hash: c.hash });
+  const isHead = st.status.head && st.status.head.hash === c.hash;
+  const v = await form({
+    title: `修改提交訊息（${c.hash.slice(0, 7)}）`,
+    desc: isHead ? '只改訊息，不會把已暫存的變更加進去。' : '會用互動式重定基底改寫這個提交之後的歷史（提交編號都會改變）。已經推送過的提交改寫後需要強制推送。',
+    ok: '修改',
+    fields: [{ name: 'message', label: '提交訊息', type: 'textarea', rows: 6, value: info.message }],
+    validate: (x) => (!x.message.trim() ? '訊息不能是空的' : ''),
+  });
+  if (!v || v.message.trim() === info.message.trim()) return;
+  const run = () => api('reword', { hash: c.hash, message: v.message });
+  const r = isHead ? await run() : await withStash('修改提交訊息', run);
+  if (r && r.conflict) { await onConflict(r); return; }
+  if (r) notice('已修改提交訊息', 'ok');
+  await refreshAll();
+}
+
+const RB_ACTIONS = [['pick', '保留（pick）'], ['reword', '改訊息（reword）'], ['squash', '併入上一個，合併訊息（squash）'], ['fixup', '併入上一個，捨棄訊息（fixup）'], ['drop', '移除（drop）']];
+const rb = { base: null, steps: [], order: [] };
+
+/** 互動式重定基底到這個提交：重新排序、合併、改訊息、移除這個提交之後的提交 */
+async function interactiveRebaseFlow(c) {
+  if (!st.status.branch) { notice('目前不在任何分支上，無法重定基底', 'err'); return; }
+  const list = await api('rebase:list', { base: c.hash });
+  if (!list.length) { notice('這個提交之後沒有其他提交'); return; }
+  rb.base = c;
+  rb.order = list.map((x) => x.hash);
+  rb.steps = list.map((x) => ({ ...x, action: 'pick', edit: x.message, squashMsg: '' }));
+  $('#rbTitle').textContent = `互動式重定基底：${st.status.branch} 到 ${c.hash.slice(0, 7)}`;
+  $('#rbDesc').textContent = `${list.length} 個提交，由舊到新排列（上面的先套用）。用 ↑↓ 調整順序、選擇每個提交要做什麼。「併入上一個」會和上面那個提交合成一個。已推送過的提交改寫後需要強制推送。`;
+  renderRb();
+  $('#rbPanel').hidden = false;
+}
+
+function rbProblem() {
+  const kept = rb.steps.filter((s) => s.action !== 'drop');
+  if (!kept.length) return '至少要保留一個提交（全部移除請改用「重設」）';
+  if (kept[0].action === 'squash' || kept[0].action === 'fixup') return '第一個保留的提交不能併入上一個提交';
+  if (rb.steps.some((s) => s.action === 'reword' && !s.edit.trim())) return '改訊息的提交，訊息不能是空的';
+  return '';
+}
+
+function renderRb() {
+  const n = rb.steps.length;
+  $('#rbList').innerHTML = rb.steps.map((s, i) => {
+    const sel = `<select data-i="${i}">${RB_ACTIONS.map(([v, l]) => `<option value="${v}"${v === s.action ? ' selected' : ''}>${l}</option>`).join('')}</select>`;
+    const cls = s.action === 'drop' ? ' drop' : s.action === 'squash' || s.action === 'fixup' ? ' fold' : '';
+    let msg = '';
+    if (s.action === 'reword') msg = `<div class="rbmsg"><textarea data-msg="${i}" spellcheck="false">${esc(s.edit)}</textarea></div>`;
+    if (s.action === 'squash') msg = `<div class="rbmsg"><textarea data-sq="${i}" spellcheck="false" placeholder="合併後的訊息（空白時把兩個提交的訊息接在一起）">${esc(s.squashMsg)}</textarea></div>`;
+    return `<div class="rbrow${cls}"><button class="ib sm" data-mv="${i}:-1" title="往上"${i ? '' : ' disabled'}>↑</button><button class="ib sm" data-mv="${i}:1" title="往下"${i < n - 1 ? '' : ' disabled'}>↓</button>`
+      + `${sel}<span class="sha">${esc(s.short)}</span><span class="subj" title="${esc(s.message)}">${esc(s.subject)}</span></div>${msg}`;
+  }).join('');
+  $('#rbHint').textContent = rbProblem();
+}
+
+function initRebase() {
+  const box = $('#rbPanel');
+  box.addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (!b) { if (e.target === box) box.hidden = true; return; }
+    if (b.dataset.mv) {
+      const [i, d] = b.dataset.mv.split(':').map(Number);
+      const j = i + d;
+      if (j < 0 || j >= rb.steps.length) return;
+      [rb.steps[i], rb.steps[j]] = [rb.steps[j], rb.steps[i]];
+      renderRb();
+      return;
+    }
+    if (b.dataset.rb === 'close') { box.hidden = true; return; }
+    if (b.dataset.rb === 'start') rbStart().catch(fail);
+  });
+  box.addEventListener('change', (e) => {
+    const i = e.target.dataset.i;
+    if (i === undefined) return;
+    rb.steps[Number(i)].action = e.target.value;
+    renderRb();
+  });
+  box.addEventListener('input', (e) => {
+    if (e.target.dataset.msg !== undefined) rb.steps[Number(e.target.dataset.msg)].edit = e.target.value;
+    if (e.target.dataset.sq !== undefined) rb.steps[Number(e.target.dataset.sq)].squashMsg = e.target.value;
+    $('#rbHint').textContent = rbProblem();
+  });
+  box.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.stopPropagation(); box.hidden = true; } });
+}
+
+async function rbStart() {
+  const p = rbProblem();
+  if (p) { $('#rbHint').textContent = p; return; }
+  const steps = rb.steps.map((s) => ({ hash: s.hash, action: s.action, message: s.action === 'reword' ? s.edit : s.action === 'squash' ? s.squashMsg : '' }));
+  const changed = steps.some((s, i) => s.action !== 'pick' || s.hash !== rb.order[i]);
+  $('#rbPanel').hidden = true;
+  if (!changed) { notice('沒有變更，歷史保持不變'); return; }
+  const r = await withStash('重定基底', () => api('rebase:interactive', { base: rb.base.hash, steps }));
+  if (r && r.conflict) { await onConflict(r); return; }
+  if (r) notice('互動式重定基底完成', 'ok');
+  await refreshAll();
+}
+
 /* ───────────── 差異比對 ───────────── */
 
 class DiffView {
   constructor(tab) {
     this.tab = tab;
     this.expanded = new Set();
+    this.selDel = new Set(); // 選取的刪除行（左側行索引）
+    this.selAdd = new Set(); // 選取的新增行（右側行索引）
     this.el = document.createElement('div');
     this.el.className = 'view diff';
-    this.el.innerHTML = '<div class="dhead"></div><div class="dlabels"><div></div><div></div></div><div class="dbody"></div>';
+    this.el.innerHTML = '<div class="dhead"></div><div class="dsel" hidden></div><div class="dlabels"><div></div><div></div></div><div class="dbody"></div>';
     this.head = $('.dhead', this.el);
+    this.selBar = $('.dsel', this.el);
     this.body = $('.dbody', this.el);
+    this.body.tabIndex = 0;
+    this.body.addEventListener('keydown', (e) => { if (e.key === 'Escape' && (this.selDel.size || this.selAdd.size)) { e.stopPropagation(); this.clearSel(); } });
     this.body.addEventListener('click', (e) => {
       const f = e.target.closest('.fold');
-      if (f) { this.expanded.add(Number(f.dataset.start)); this.renderBody(); }
+      if (f) { this.expanded.add(Number(f.dataset.start)); this.renderBody(); return; }
+      const h = e.target.closest('[data-hact]');
+      if (h) { const blk = this.blocks[Number(h.closest('.hunk').dataset.blk)]; if (blk) this.partialAct(h.dataset.hact, { del: blk.del, add: blk.add }).catch(fail); return; }
+      // 點內容（沒有選取文字時）選取那一行
+      const cell = e.target.closest('.c[data-la], .c[data-lb]');
+      if (cell && this.pickable && window.getSelection().isCollapsed) {
+        if (e.shiftKey && this.lastPick) this.pickRange(this.lastPick, cell);
+        else this.toggle(cell, !this.isPicked(cell));
+        this.lastPick = cell;
+        this.updateSel();
+      }
+    });
+    // 在行號上按住拖曳可以連續選取多行；Shift 點選選取一段範圍
+    this.body.addEventListener('mousedown', (e) => {
+      const cell = e.target.closest('.n[data-la], .n[data-lb], .s[data-la], .s[data-lb]');
+      if (!cell || !this.pickable || e.button !== 0) return;
+      e.preventDefault();
+      if (e.shiftKey && this.lastPick) { this.pickRange(this.lastPick, cell); this.updateSel(); return; }
+      const on = !this.isPicked(cell);
+      this.toggle(cell, on);
+      this.lastPick = cell;
+      this.updateSel();
+      const over = (ev) => {
+        const c = ev.target.closest && ev.target.closest('[data-la], [data-lb]');
+        if (c && this.body.contains(c)) { this.toggle(c, on); this.updateSel(); }
+      };
+      const up = () => { this.body.removeEventListener('mouseover', over); removeEventListener('mouseup', up); };
+      this.body.addEventListener('mouseover', over);
+      addEventListener('mouseup', up);
+    });
+    this.selBar.addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      if (b.dataset.sact === 'clear') { this.clearSel(); return; }
+      this.partialAct(b.dataset.sact, { del: [...this.selDel], add: [...this.selAdd] }).catch(fail);
     });
     this.head.addEventListener('click', (e) => {
       const b = e.target.closest('button');
       if (!b) return;
       if (b.dataset.mode) { this.expanded.clear(); st.diffMode = b.dataset.mode; store.set('diffMode', st.diffMode); this.render(); return; }
       if (b.dataset.nav) { this.nav(Number(b.dataset.nav)); return; }
+      if (b.dataset.ws !== undefined) { st.diffWs = !st.diffWs; store.set('diffWs', st.diffWs); this.recompute(); this.render(); return; }
+      if (b.dataset.wrap !== undefined) { st.diffWrap = !st.diffWrap; store.set('diffWrap', st.diffWrap); this.render(); return; }
       const src = this.tab.src;
       const act = b.dataset.act;
       if (act === 'reload') { this.load(); return; }
+      if (act === 'history') { openHistory(src.path); return; }
+      if (act === 'blame') { openBlame(src.path, src.kind === 'commit' ? src.hash : ''); return; }
       if (act === 'open') { api('openFile', { path: src.path }).catch(fail); return; }
       onChangeAction(act, src.area, src.path).then(() => this.afterAction()).catch(fail);
     });
   }
 
+  /** 是否可以逐行操作：工作區的檔案、文字、沒有忽略空白 */
+  get pickable() {
+    const src = this.tab.src;
+    const d = this.data;
+    if (!d || src.kind !== 'work' || !['unstaged', 'untracked', 'staged'].includes(src.area)) return false;
+    if (src.area === 'staged' && src.orig) return false;
+    const bad = (x) => x.binary || x.tooLarge || x.readOnly;
+    return !bad(d.left) && !bad(d.right) && !st.diffWs;
+  }
+
+  isPicked(cell) {
+    return cell.dataset.la !== undefined ? this.selDel.has(Number(cell.dataset.la)) : this.selAdd.has(Number(cell.dataset.lb));
+  }
+
+  toggle(cell, on) {
+    const set = cell.dataset.la !== undefined ? this.selDel : this.selAdd;
+    const n = Number(cell.dataset.la !== undefined ? cell.dataset.la : cell.dataset.lb);
+    if (on) set.add(n); else set.delete(n);
+  }
+
+  /** 選取兩個儲存格之間（依畫面順序）所有可選取的行 */
+  pickRange(from, to) {
+    const cells = $$('.n[data-la], .n[data-lb]', this.body);
+    const idx = (c) => cells.findIndex((x) => x.closest('.dr') === c.closest('.dr'));
+    let i = idx(from), j = idx(to);
+    if (i < 0 || j < 0) { this.toggle(to, true); return; }
+    if (i > j) [i, j] = [j, i];
+    // 同一列的兩側都算在範圍內
+    while (j + 1 < cells.length && cells[j + 1].closest('.dr') === cells[j].closest('.dr')) j++;
+    while (i > 0 && cells[i - 1].closest('.dr') === cells[i].closest('.dr')) i--;
+    for (const c of cells.slice(i, j + 1)) this.toggle(c, true);
+  }
+
+  clearSel() {
+    this.selDel.clear();
+    this.selAdd.clear();
+    this.lastPick = null;
+    this.updateSel();
+  }
+
+  /** 更新選取的標示與上方的動作列 */
+  updateSel() {
+    for (const c of $$('[data-la], [data-lb]', this.body)) c.classList.toggle('pick', this.isPicked(c));
+    const n = this.selDel.size + this.selAdd.size;
+    const src = this.tab.src;
+    if (!this.pickable) {
+      const why = this.data && src.kind === 'work' && st.diffWs ? '忽略空白時不能逐行暫存' : '';
+      this.selBar.hidden = !why;
+      this.selBar.innerHTML = why ? `<span class="hint">${esc(why)}</span>` : '';
+      return;
+    }
+    if (!n) {
+      this.selBar.hidden = false;
+      const verb = src.area === 'staged' ? '取消暫存' : '暫存或捨棄';
+      this.selBar.innerHTML = `<span class="hint">點行號選取要${verb}的行（拖曳選取多行、Shift 點選選取一段），或用每段變更上方的按鈕整段處理。</span>`;
+      return;
+    }
+    const lines = `${n} 行（刪除 ${this.selDel.size}、新增 ${this.selAdd.size}）`;
+    const acts = src.area === 'staged'
+      ? '<button class="sm" data-sact="unstage">− 取消暫存選取的行</button>'
+      : '<button class="sm" data-sact="stage">＋ 暫存選取的行</button><button class="secondary sm" data-sact="discard">↺ 捨棄選取的行</button>';
+    this.selBar.hidden = false;
+    this.selBar.innerHTML = `<span class="t">已選取 ${esc(lines)}</span>${acts}<span class="sp"></span><button class="ib sm" data-sact="clear" title="清除選取（Esc）">✕</button>`;
+  }
+
+  /** 暫存、取消暫存或捨棄一部分的行 */
+  async partialAct(action, { del, add }) {
+    const src = this.tab.src;
+    const d = this.data;
+    if (!d || (!del.length && !add.length)) return;
+    if (action === 'discard') {
+      const n = del.length + add.length;
+      if (!await confirmBox(`捨棄選取的 ${n} 行變更？`, '捨棄', { type: 'warning', detail: '工作目錄中這幾行會還原成暫存區的內容，目前的修改無法復原。' })) return;
+    }
+    await api('partial', { area: src.area, action, path: src.path, del, add, check: `${C.textHash(d.left.text)}:${C.textHash(d.right.text)}` });
+    this.selDel.clear();
+    this.selAdd.clear();
+    this.lastPick = null;
+    notice(action === 'stage' ? '已暫存選取的變更' : action === 'unstage' ? '已取消暫存選取的變更' : '已捨棄選取的變更', 'ok');
+    await refresh();
+    await this.afterAction();
+  }
+
   async afterAction() {
-    // 動作後檔案可能換到另一組（例如暫存後從「變更」到「已暫存」）
+    // 動作後檔案可能換到另一組（例如暫存後從「變更」到「已暫存」）；還在原本那組時留在原地
     const src = this.tab.src;
     const s = st.status;
-    const next = ['unstaged', 'staged', 'untracked'].map((a) => [a, entryOf(a, src.path)]).find(([, e]) => e);
+    const order = [src.area, 'unstaged', 'staged', 'untracked'];
+    const next = order.map((a) => [a, entryOf(a, src.path)]).find(([, e]) => e);
     if (!next) { closeTab(this.tab.id); return; }
     const [area, e] = next;
+    if (area !== src.area) { this.expanded.clear(); this.clearSel(); }
     this.tab.src = { kind: 'work', area, ...e };
+    this.tab.title = `${basename(e.path)}${area === 'staged' ? '（已暫存）' : ''}`;
+    this.tab.key = `w:${area}:${e.path}`;
+    renderTabs();
     if (s) this.load();
+  }
+
+  recompute() {
+    const norm = st.diffWs ? (l) => l.map(C.normWs) : (l) => l;
+    this.ops = C.diffLines(norm(this.a), norm(this.b));
+    this.stats = C.diffStats(this.ops);
   }
 
   async load() {
     const src = this.tab.src;
-    this.body.innerHTML = '<div class="dnote">讀取中…</div>';
+    const same = this.data && this.data.path === src.path && this.loadedKey === `${src.kind}:${src.area || src.hash}:${src.path}`;
+    const keep = same ? this.body.scrollTop : 0;
+    if (!same) { this.body.innerHTML = '<div class="dnote">讀取中…</div>'; this.selDel.clear(); this.selAdd.clear(); this.lastPick = null; }
     try {
       let d;
       if (src.kind === 'work') {
         d = await api('diff', { area: src.area, path: src.path, orig: src.orig });
+      } else if (src.kind === 'cmp') {
+        d = await api('compare:diff', { hash: src.hash, path: src.path, orig: src.orig });
       } else {
         d = await api('commit:diff', { hash: src.hash, parent: src.parent || undefined, path: src.path, orig: src.orig });
         // 儲藏中未追蹤的檔案放在第三個父提交
         if (!d.right.exists && src.untrackedHash) d = await api('commit:diff', { hash: src.untrackedHash, path: src.path });
       }
+      if (this.tab.src !== src) return;
+      // 內容變了，選取的行號就不再可靠
+      if (same && this.data && (this.data.left.text !== d.left.text || this.data.right.text !== d.right.text)) { this.selDel.clear(); this.selAdd.clear(); this.lastPick = null; }
       this.data = d;
+      this.loadedKey = `${src.kind}:${src.area || src.hash}:${src.path}`;
       this.a = C.toLines(d.left.text);
       this.b = C.toLines(d.right.text);
-      this.ops = C.diffLines(this.a, this.b);
-      this.stats = C.diffStats(this.ops);
+      this.recompute();
       this.render();
+      if (same) this.body.scrollTop = keep;
     } catch (err) {
       this.data = null;
       this.head.innerHTML = '<span class="sp"></span><button class="ib sm" data-act="reload" title="重新整理">⟳</button>';
+      this.selBar.hidden = true;
       this.body.innerHTML = `<div class="dnote">無法比對：${esc(errInfo(err).message)}</div>`;
     }
   }
@@ -1796,19 +2631,26 @@ class DiffView {
     const d = this.data;
     if (!d) return;
     const s = this.stats;
-    const where = src.kind === 'work' ? (GROUPS.find((g) => g[0] === src.area) || [])[1] : `提交 ${src.hash.slice(0, 7)}`;
+    const where = src.kind === 'work' ? (GROUPS.find((g) => g[0] === src.area) || [])[1] : src.kind === 'cmp' ? `${src.hash.slice(0, 7)} ↔ 工作目錄` : `提交 ${src.hash.slice(0, 7)}`;
     let acts = '';
     if (src.kind === 'work') {
-      if (src.area === 'unstaged') acts = '<button class="secondary sm" data-act="discard">↺ 捨棄</button><button class="sm" data-act="stage">＋ 暫存</button>';
-      else if (src.area === 'staged') acts = '<button class="secondary sm" data-act="unstage">− 取消暫存</button>';
-      else if (src.area === 'untracked') acts = '<button class="secondary sm" data-act="discard">🗑 刪除</button><button class="sm" data-act="stage">＋ 暫存</button>';
-      if (src.status !== 'D') acts += '<button class="secondary sm" data-act="open">開啟檔案</button>';
+      if (src.area === 'unstaged') acts = '<button class="secondary sm" data-act="discard">↺ 捨棄檔案</button><button class="sm" data-act="stage">＋ 暫存檔案</button>';
+      else if (src.area === 'staged') acts = '<button class="secondary sm" data-act="unstage">− 取消暫存檔案</button>';
+      else if (src.area === 'untracked') acts = '<button class="secondary sm" data-act="discard">🗑 刪除</button><button class="sm" data-act="stage">＋ 暫存檔案</button>';
     }
+    if ((src.kind === 'work' || src.kind === 'cmp') && src.status !== 'D') acts += '<button class="secondary sm" data-act="open">開啟檔案</button>';
+    const tracked = !(src.kind === 'work' && src.area === 'untracked') && !(src.kind === 'work' && src.area === 'staged' && src.status === 'A');
+    const ft = tracked && !d.left.binary && !d.right.binary && !(src.status === 'D' && src.kind !== 'commit');
+    if (tracked && this.tab.kind !== undefined) acts += '<button class="ib sm" data-act="history" title="檔案歷史">🕘</button>';
+    if (ft) acts += '<button class="ib sm" data-act="blame" title="逐行追溯（blame）：每一行最後是哪個提交改的">👤</button>';
     this.head.innerHTML = `<span class="p" title="${esc(src.path)}">${esc(src.path)}</span><span class="st g-${esc(src.status)}">${esc(where || '')}・${esc(src.label || '')}</span>`
       + `<span class="add">+${s.added}</span><span class="del">−${s.removed}</span><span class="sp"></span>`
       + `<div class="seg"><button data-mode="sbs" class="${st.diffMode === 'sbs' ? 'on' : ''}">並排</button><button data-mode="uni" class="${st.diffMode === 'uni' ? 'on' : ''}">行內</button></div>`
+      + `<button class="ib sm${st.diffWrap ? ' on' : ''}" data-wrap title="${st.diffWrap ? '目前自動換行（點選改成不換行、左右捲動）' : '目前不換行（點選改成自動換行）'}">↵</button>`
+      + `<button class="ib sm${st.diffWs ? ' on' : ''}" data-ws title="${st.diffWs ? '目前忽略空白的差異（點選改回顯示）' : '忽略空白的差異'}">␣</button>`
       + '<button class="ib sm" data-nav="-1" title="上一個變更">↑</button><button class="ib sm" data-nav="1" title="下一個變更">↓</button>'
-      + `${acts}<button class="ib sm" data-act="reload" title="重新整理">⟳</button>`;
+      // 內嵌在檔案歷史時，重新整理由歷史分頁負責
+      + `${acts}${this.tab.kind !== undefined ? '<button class="ib sm" data-act="reload" title="重新整理">⟳</button>' : ''}`;
     const labels = $('.dlabels', this.el);
     labels.hidden = st.diffMode !== 'sbs';
     labels.children[0].textContent = `${d.left.label}${d.left.note ? `（${d.left.note}）` : ''}`;
@@ -1819,38 +2661,73 @@ class DiffView {
   renderBody() {
     const d = this.data;
     if (!d) return;
-    if (d.left.binary || d.right.binary) { this.body.innerHTML = '<div class="dnote">二進位檔案，無法顯示差異。</div>'; return; }
-    if (d.left.tooLarge || d.right.tooLarge) { this.body.innerHTML = `<div class="dnote">${esc(d.left.note || d.right.note)}</div>`; return; }
-    if (!this.ops.length) { this.body.innerHTML = '<div class="dnote">檔案是空的。</div>'; return; }
+    this.blocks = [];
+    const done = (html) => { this.body.innerHTML = html; this.updateSel(); };
+    if (d.left.image || d.right.image) {
+      const fig = (x) => `<figure><figcaption>${esc(x.label)}${x.size ? `・${(x.size / 1024).toFixed(1)} KB` : ''}</figcaption>${x.image ? `<img src="${x.image}" alt="">` : `<div class="dnote">${x.exists ? esc(x.note || '無法顯示') : '（不存在）'}</div>`}</figure>`;
+      this.body.className = 'dbody';
+      return done(`<div class="imgdiff">${fig(d.left)}${fig(d.right)}</div>`);
+    }
+    if (d.left.binary || d.right.binary) return done('<div class="dnote">二進位檔案，無法顯示差異。</div>');
+    if (d.left.tooLarge || d.right.tooLarge) return done(`<div class="dnote">${esc(d.left.note || d.right.note)}</div>`);
+    if (!this.ops.length) return done('<div class="dnote">檔案是空的。</div>');
     if (!this.stats.added && !this.stats.removed) {
-      this.body.innerHTML = `<div class="dnote">內容相同${this.tab.src.status === 'R' ? '（只有重新命名）' : '（可能只有權限或換行字元不同）'}。</div>`;
-      return;
+      return done(`<div class="dnote">內容相同${st.diffWs ? '（忽略空白）' : this.tab.src.status === 'R' ? '（只有重新命名）' : '（可能只有權限或換行字元不同）'}。</div>`);
     }
     const sbs = st.diffMode === 'sbs';
-    this.body.className = `dbody ${sbs ? 'sbs' : 'uni'}`;
+    const pick = this.pickable;
+    const area = this.tab.src.area;
+    this.body.className = `dbody ${sbs ? 'sbs' : 'uni'}${pick ? ' pickable' : ''}${st.diffWrap ? '' : ' nowrap'}`;
     const digits = String(Math.max(this.a.length, this.b.length)).length;
     this.body.style.setProperty('--lnw', `calc(${digits}ch + 16px)`);
+    if (!st.diffWrap) {
+      // 不換行時以最長的一行決定列寬，並排的兩側才會對齊（全形字約佔兩格、tab 四格）
+      const w = (l) => { let n = 0; for (const ch of l) n += ch === '\t' ? 4 : /[\u1100-\uffef]/.test(ch) ? 2 : 1; return n; };
+      let max = 0;
+      for (const l of this.a) max = Math.max(max, w(l));
+      for (const l of this.b) max = Math.max(max, w(l));
+      this.body.style.setProperty('--roww', sbs ? `calc(2 * (${max}ch + 16px + var(--lnw)))` : `calc(${max}ch + 16px + 2 * var(--lnw) + 18px)`);
+    }
     const rows = C.fold(sbs ? C.sideBySide(this.ops) : C.unified(this.ops), 3, this.expanded);
     const A = (i) => esc(this.a[i] || '');
     const B = (i) => esc(this.b[i] || '');
+    const la = (i) => (pick ? ` data-la="${i}"` : '');
+    const lb = (i) => (pick ? ` data-lb="${i}"` : '');
+    const hunkActs = area === 'staged'
+      ? '<button class="secondary" data-hact="unstage">− 取消暫存這段</button>'
+      : '<button class="secondary" data-hact="stage">＋ 暫存這段</button><button class="secondary" data-hact="discard">↺ 捨棄這段</button>';
     const out = [];
     let prev = 'eq';
     for (const r of rows) {
       if (r.kind === 'fold') { out.push(`<div class="dr fold" data-start="${r.start}"><span>⋯ 展開 ${r.count} 行未變更的內容</span></div>`); prev = 'eq'; continue; }
-      const start = r.kind !== 'eq' && prev === 'eq' ? ' data-chg="1"' : '';
+      const first = r.kind !== 'eq' && prev === 'eq';
       prev = r.kind;
+      if (first) {
+        this.blocks.push({ del: [], add: [] });
+        if (pick) out.push(`<div class="dr hunk" data-blk="${this.blocks.length - 1}"><span>第 ${this.blocks.length} 段變更${hunkActs}</span></div>`);
+      }
+      if (r.kind !== 'eq') {
+        const blk = this.blocks[this.blocks.length - 1];
+        if (r.a !== null) blk.del.push(r.a);
+        if (r.b !== null) blk.add.push(r.b);
+      }
+      const start = first ? ' data-chg="1"' : '';
       if (sbs) {
         const lk = r.kind === 'eq' ? '' : r.a === null ? 'none' : 'del';
         const rk = r.kind === 'eq' ? '' : r.b === null ? 'none' : 'add';
-        out.push(`<div class="dr"${start}><span class="n ${lk}">${r.a !== null ? r.a + 1 : ''}</span><span class="c ${lk}">${r.a !== null ? A(r.a) : ''}</span>`
-          + `<span class="n ${rk}">${r.b !== null ? r.b + 1 : ''}</span><span class="c ${rk}">${r.b !== null ? B(r.b) : ''}</span></div>`);
+        const L = lk === 'del' ? la(r.a) : '';
+        const R = rk === 'add' ? lb(r.b) : '';
+        out.push(`<div class="dr"${start}><span class="n ${lk}"${L}>${r.a !== null ? r.a + 1 : ''}</span><span class="c ${lk}"${L}>${r.a !== null ? A(r.a) : ''}</span>`
+          + `<span class="n ${rk}"${R}>${r.b !== null ? r.b + 1 : ''}</span><span class="c ${rk}"${R}>${r.b !== null ? B(r.b) : ''}</span></div>`);
       } else {
         const k = r.kind === 'eq' ? '' : r.kind;
-        out.push(`<div class="dr"${start}><span class="n ${k}">${r.a !== null ? r.a + 1 : ''}</span><span class="n ${k}">${r.b !== null ? r.b + 1 : ''}</span>`
-          + `<span class="s ${k}">${r.kind === 'del' ? '−' : r.kind === 'add' ? '+' : ''}</span><span class="c ${k}">${r.kind === 'del' ? A(r.a) : B(r.b)}</span></div>`);
+        const at = k === 'del' ? la(r.a) : k === 'add' ? lb(r.b) : '';
+        out.push(`<div class="dr"${start}><span class="n ${k}"${at}>${r.a !== null ? r.a + 1 : ''}</span><span class="n ${k}"${at}>${r.b !== null ? r.b + 1 : ''}</span>`
+          + `<span class="s ${k}"${at}>${r.kind === 'del' ? '−' : r.kind === 'add' ? '+' : ''}</span><span class="c ${k}"${at}>${r.kind === 'del' ? A(r.a) : B(r.b)}</span></div>`);
       }
     }
-    this.body.innerHTML = out.join('');
+    // 摺疊的段落不在畫面上，但仍屬於同一段變更：區塊以畫面為準即可（摺疊只發生在沒有變更的行）
+    done(out.join(''));
   }
 
   nav(dir) {
@@ -1882,7 +2759,7 @@ class DiffView {
 
 /** 開啟差異分頁：單擊以預覽分頁開啟（取代上一個預覽），pin 時固定 */
 function openDiff(src, { pin = false } = {}) {
-  const key = src.kind === 'work' ? `w:${src.area}:${src.path}` : `c:${src.hash}:${src.path}`;
+  const key = src.kind === 'work' ? `w:${src.area}:${src.path}` : `${src.kind}:${src.hash}:${src.path}`;
   const title = src.title || `${basename(src.path)}${src.kind === 'work' ? (src.area === 'staged' ? '（已暫存）' : '') : ''}`;
   let t = st.tabs.find((x) => x.kind === 'diff' && x.key === key);
   if (!t) {
@@ -1903,6 +2780,281 @@ function openDiff(src, { pin = false } = {}) {
   activate(t.id);
   t.view.load();
   return t;
+}
+
+/* ───────────── 檔案歷史 ───────────── */
+
+const STATUS_LABEL = { M: '修改', A: '新增', D: '刪除', R: '重新命名', C: '複製', T: '類型變更' };
+
+class HistoryView {
+  constructor(tab) {
+    this.tab = tab;
+    this.items = [];
+    this.sel = -1;
+    this.el = document.createElement('div');
+    this.el.className = 'view hist';
+    this.el.innerHTML = '<div class="ghead"><span class="t"></span><span class="sp"></span><button class="ib sm" data-h="blame" title="逐行追溯（blame）">👤</button><button class="ib sm" data-h="reload" title="重新整理">⟳</button></div>'
+      + '<div class="hsplit"><div class="hlist" tabindex="0"></div><div class="hdiff"></div></div>';
+    this.list = $('.hlist', this.el);
+    this.inner = { src: null };
+    this.diff = new DiffView(this.inner);
+    $('.hdiff', this.el).append(this.diff.el);
+    $('.ghead', this.el).addEventListener('click', (e) => {
+      const b = e.target.closest('[data-h]');
+      if (!b) return;
+      if (b.dataset.h === 'reload') this.load().catch(fail);
+      else openBlame(this.tab.path, this.items[this.sel] ? this.items[this.sel].hash : '');
+    });
+    this.list.addEventListener('click', (e) => { const r = e.target.closest('.hrow'); if (r) this.select(Number(r.dataset.i)); });
+    this.list.addEventListener('keydown', (e) => {
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+      e.preventDefault();
+      this.select(Math.max(0, Math.min(this.items.length - 1, this.sel + (e.key === 'ArrowDown' ? 1 : -1))));
+    });
+    this.list.addEventListener('contextmenu', (e) => {
+      const r = e.target.closest('.hrow');
+      if (!r) return;
+      const h = this.items[Number(r.dataset.i)];
+      this.select(Number(r.dataset.i));
+      contextMenu(e, [
+        ['在線圖中顯示', () => showCommitInGraph(h.hash)],
+        ['這個版本的逐行追溯', () => openBlame(h.path, h.hash)],
+        ['與工作目錄比較', () => openDiff({ kind: 'cmp', hash: h.hash, path: this.tab.path, orig: h.path !== this.tab.path ? h.path : undefined, status: 'M', label: '比較', title: `${basename(this.tab.path)}（${h.hash.slice(0, 7)} ↔ 工作目錄）` }, { pin: true })],
+        '-',
+        ['複製提交編號', () => copyText(h.hash)],
+        ['複製訊息', () => copyText(h.subject)],
+      ]);
+    });
+  }
+
+  async load() {
+    this.list.innerHTML = '<div class="dnote">讀取中…</div>';
+    this.items = await api('file:history', { path: this.tab.path });
+    $('.t', this.el).textContent = `${this.tab.path} 的歷史・${this.items.length} 個提交`;
+    if (!this.items.length) { this.list.innerHTML = '<div class="dnote">這個檔案還沒有提交過。</div>'; return; }
+    this.list.innerHTML = this.items.map((h, i) => `<div class="hrow" data-i="${i}" title="${esc(`${h.hash}\n${h.author}・${C.formatDate(h.time)}${h.orig ? `\n${h.orig} → ${h.path}` : h.path !== this.tab.path ? `\n當時的路徑：${h.path}` : ''}`)}">`
+      + `<div class="s1"><span class="subj">${esc(h.subject)}</span><span class="gs g-${esc(h.status)}">${esc(h.status)}</span></div>`
+      + `<div class="s2"><span class="sha">${esc(h.hash.slice(0, 7))}</span><span>${esc(h.author)}</span><span class="sp"></span><span>${esc(C.ago(h.time))}</span></div></div>`).join('');
+    this.select(Math.max(0, Math.min(this.sel, this.items.length - 1)));
+  }
+
+  select(i) {
+    const h = this.items[i];
+    if (!h) return;
+    this.sel = i;
+    for (const r of $$('.hrow', this.list)) r.classList.toggle('sel', Number(r.dataset.i) === i);
+    const row = $(`.hrow[data-i="${i}"]`, this.list);
+    if (row) row.scrollIntoView({ block: 'nearest' });
+    this.inner.src = { kind: 'commit', hash: h.hash, parent: h.parents[0] || '', path: h.path, orig: h.orig, status: h.status, label: STATUS_LABEL[h.status] || h.status };
+    this.diff.load();
+  }
+}
+
+function openHistory(p) {
+  const key = `h:${p}`;
+  let t = st.tabs.find((x) => x.kind === 'hist' && x.key === key);
+  if (!t) {
+    t = { kind: 'hist', key, path: p, title: `🕘 ${basename(p)}`, tip: `${p} 的歷史` };
+    t.view = new HistoryView(t);
+    addTab(t);
+    t.view.load().catch(fail);
+  } else activate(t.id);
+}
+
+/** 在線圖中選取並顯示提交（不在目前載入的範圍時只顯示內容） */
+function showCommitInGraph(hash) {
+  const g = graphTab();
+  activate(g.id);
+  const i = st.log ? st.log.commits.findIndex((c) => c.hash === hash) : -1;
+  if (i >= 0) g.view.select(i, { scroll: true });
+  else g.view.showCommit(hash).catch(fail);
+}
+
+/* ───────────── 逐行追溯（blame） ───────────── */
+
+class BlameView {
+  constructor(tab) {
+    this.tab = tab;
+    this.el = document.createElement('div');
+    this.el.className = 'view blame';
+    this.el.innerHTML = '<div class="ghead"><span class="t"></span><span class="sp"></span><button class="ib sm" data-b="hist" title="檔案歷史">🕘</button><button class="ib sm" data-b="reload" title="重新整理">⟳</button></div><div class="bbody"></div>';
+    this.body = $('.bbody', this.el);
+    $('.ghead', this.el).addEventListener('click', (e) => {
+      const b = e.target.closest('[data-b]');
+      if (!b) return;
+      if (b.dataset.b === 'reload') this.load().catch(fail); else openHistory(this.tab.path);
+    });
+    this.body.addEventListener('click', (e) => {
+      const g = e.target.closest('.bg[data-h]');
+      if (!g) return;
+      if (/^0+$/.test(g.dataset.h)) { notice('這幾行還沒有提交'); return; }
+      showCommitInGraph(g.dataset.h);
+    });
+  }
+
+  async load() {
+    this.body.innerHTML = '<div class="dnote">讀取中…</div>';
+    const r = await api('blame', { path: this.tab.path, rev: this.tab.rev || undefined });
+    const n = r.lines.length;
+    $('.t', this.el).textContent = `${r.path}${this.tab.rev ? `（${this.tab.rev.slice(0, 7)}）` : '（工作目錄）'}・${n} 行`;
+    const order = [];
+    for (const l of r.lines) if (!order.includes(l.hash)) order.push(l.hash);
+    const digits = String(n).length;
+    this.body.style.setProperty('--lnw', `calc(${digits}ch + 16px)`);
+    let prev = null;
+    let band = 0;
+    this.body.innerHTML = r.lines.map((l, i) => {
+      const c = r.commits[l.hash] || {};
+      const first = l.hash !== prev;
+      if (first) band ^= 1;
+      prev = l.hash;
+      const zero = /^0+$/.test(l.hash);
+      const info = first ? (zero ? '<span class="who">尚未提交</span>' : `<span class="sha">${esc(l.hash.slice(0, 7))}</span><span class="who">${esc(c.author || '')}</span><span class="when">${esc(c.time ? C.ago(c.time) : '')}</span>`) : '';
+      const tip = zero ? '尚未提交的變更' : `${l.hash.slice(0, 10)} ${c.summary || ''}\n${c.author || ''}・${c.time ? C.formatDate(c.time) : ''}\n點選在線圖中顯示`;
+      return `<div class="bl b${band}${first ? ' first' : ''}"><span class="bg" data-h="${esc(l.hash)}" title="${esc(tip)}">${info}</span><span class="n">${i + 1}</span><span class="c">${esc(l.text)}</span></div>`;
+    }).join('');
+  }
+}
+
+function openBlame(p, rev = '') {
+  const key = `b:${p}:${rev}`;
+  let t = st.tabs.find((x) => x.kind === 'blame' && x.key === key);
+  if (!t) {
+    t = { kind: 'blame', key, path: p, rev, title: `👤 ${basename(p)}${rev ? `（${rev.slice(0, 7)}）` : ''}`, tip: `${p} 的逐行追溯` };
+    t.view = new BlameView(t);
+    addTab(t);
+    t.view.load().catch((err) => { t.view.body.innerHTML = `<div class="dnote">無法逐行追溯：${esc(errInfo(err).message)}</div>`; });
+  } else activate(t.id);
+}
+
+/* ───────────── 參照紀錄（reflog） ───────────── */
+
+class ReflogView {
+  constructor(tab) {
+    this.tab = tab;
+    this.items = [];
+    this.el = document.createElement('div');
+    this.el.className = 'view reflog';
+    this.el.innerHTML = '<div class="ghead"><span class="t">參照紀錄（reflog）</span><span class="faint">HEAD 每一次移動的紀錄：被重設、重定基底或刪除分支而「不見」的提交，可以從這裡找回</span><span class="sp"></span><button class="ib sm" data-r="reload" title="重新整理">⟳</button></div><div class="rlist"></div>';
+    this.list = $('.rlist', this.el);
+    $('.ghead', this.el).addEventListener('click', (e) => { if (e.target.closest('[data-r="reload"]')) this.load().catch(fail); });
+    this.list.addEventListener('click', (e) => {
+      const r = e.target.closest('.rrow');
+      if (!r) return;
+      for (const x of $$('.rrow.sel', this.list)) x.classList.remove('sel');
+      r.classList.add('sel');
+    });
+    this.list.addEventListener('dblclick', (e) => { const r = e.target.closest('.rrow'); if (r) showCommitInGraph(this.items[Number(r.dataset.i)].hash); });
+    this.list.addEventListener('contextmenu', (e) => {
+      const r = e.target.closest('.rrow');
+      if (!r) return;
+      const x = this.items[Number(r.dataset.i)];
+      const c = { hash: x.hash, subject: x.subject, parents: [] };
+      const cur = st.status && st.status.branch;
+      contextMenu(e, [
+        ['查看這個提交', () => showCommitInGraph(x.hash)],
+        ['從這裡建立分支…', () => newBranchFlow(x.hash, x.hash.slice(0, 7))],
+        ['切換到這個提交（分離的 HEAD）', () => checkoutFlow({ commit: x.hash }, x.hash.slice(0, 7))],
+        ['與工作目錄比較', () => compareWorkingFlow(c)],
+        '-',
+        ['複製提交編號', () => copyText(x.hash)],
+        cur ? '-' : null,
+        cur ? { label: `把 ${cur} 重設到這裡` } : null,
+        cur ? ['　保留變更（mixed）', () => resetFlow(c, 'mixed')] : null,
+        cur ? ['　捨棄所有變更（hard）…', () => resetFlow(c, 'hard'), { danger: true }] : null,
+      ]);
+    });
+  }
+
+  async load() {
+    this.list.innerHTML = '<div class="dnote">讀取中…</div>';
+    this.items = await api('reflog');
+    if (!this.items.length) { this.list.innerHTML = '<div class="dnote">沒有參照紀錄。</div>'; return; }
+    this.list.innerHTML = this.items.map((x, i) => `<div class="rrow" data-i="${i}" title="${esc(`${x.hash}\n${x.subject}\n雙擊在線圖中查看，右鍵可以建立分支或重設`)}">`
+      + `<span class="ref">${esc(x.ref)}</span><span class="sha">${esc(x.hash.slice(0, 7))}</span><span class="act">${esc(x.action)}</span><span class="when">${esc(C.ago(x.time))}</span></div>`).join('');
+  }
+
+  onShow() { this.load().catch(fail); }
+}
+
+function openReflog() {
+  let t = st.tabs.find((x) => x.kind === 'reflog');
+  if (t) { activate(t.id); return; }
+  t = { kind: 'reflog', key: 'reflog', title: '↺ 參照紀錄', tip: 'HEAD 的參照紀錄（reflog）' };
+  t.view = new ReflogView(t);
+  addTab(t);
+}
+
+/* ───────────── 比較兩個提交或分支 ───────────── */
+
+/** from → to 的差異（Fork 的 Compare）；from、to 為 { hash, label } */
+async function compareRangeFlow(from, to) {
+  const files = await api('compare:range', { from: from.hash, to: to.hash });
+  const g = graphTab();
+  activate(g.id);
+  g.view.showDetail({
+    title: `${from.label} ↔ ${to.label}`,
+    message: `從 ${from.label} 到 ${to.label} 變更的檔案。`,
+    rows: [['起點', `<span class="mono">${esc(from.hash)}</span>`, true], ['終點', `<span class="mono">${esc(to.hash)}</span>`, true]],
+    files,
+    openFile: (f) => openDiff({ kind: 'commit', hash: to.hash, parent: from.hash, path: f.path, orig: f.orig, status: f.status, label: f.label, title: `${basename(f.path)}（${from.label} ↔ ${to.label}）` }),
+    actions: [['對調', () => compareRangeFlow(to, from)]],
+  });
+}
+
+/* ───────────── 子模組、工作樹 ───────────── */
+
+async function loadExtras() {
+  const [subs, wts] = await Promise.all([api('submodules').catch(() => []), api('worktrees').catch(() => [])]);
+  st.subs = subs;
+  st.worktrees = wts;
+}
+
+async function submoduleUpdateFlow(p) {
+  await api('submodule:update', { path: p });
+  notice(p ? `已更新子模組 ${p}` : '已更新所有子模組', 'ok');
+  await loadBranches();
+  await refresh();
+}
+
+/** 開啟子模組或工作樹：加入儲存庫清單並切換過去 */
+async function openRepoAt(dir, name) {
+  const res = await td.invoke('addRepo', { root: dir, name });
+  st.repos = res.repos;
+  await selectRepo(res.repo.id);
+}
+
+async function addWorktreeFlow() {
+  const b = await ensureBranches();
+  const used = new Set((st.worktrees || []).map((w) => w.branch).filter(Boolean));
+  const free = b.local.filter((x) => !used.has(x.name));
+  const parent = dirname(repo().root.replace(/\\/g, '/'));
+  const v = await form({
+    title: '新增工作樹（worktree）',
+    desc: '在另一個資料夾簽出另一個分支，兩邊可以同時修改，不必來回切換或儲藏。',
+    ok: '新增',
+    fields: [
+      { name: 'mode', label: '分支', type: 'select', value: 'new', options: [['new', '建立新分支'], ...free.map((x) => [`b:${x.name}`, `使用既有的分支 ${x.name}`])] },
+      { name: 'name', label: '新分支名稱（建立新分支時）', placeholder: '例如：feature/login' },
+      { name: 'dir', label: '資料夾', value: parent ? `${parent}/${basename(repo().root)}-wt` : '', browse: true, help: '不存在時會自動建立；已經存在時必須是空的' },
+      { name: 'open', label: '新增後開啟', type: 'checkbox', value: true },
+    ],
+    validate: (x) => (!x.dir.trim() ? '請選擇資料夾' : x.mode === 'new' && !x.name.trim() ? '請輸入新分支名稱' : ''),
+    onInput: (name, x, set) => { if (name === 'name' && x.name.trim()) set('dir', `${parent}/${basename(repo().root)}-${x.name.trim().replace(/[\\/]/g, '-')}`); },
+  });
+  if (!v) return;
+  const dir = await api('worktree:add', { dir: v.dir.trim(), ...(v.mode === 'new' ? { newBranch: v.name.trim() } : { branch: v.mode.slice(2) }) });
+  notice(`已新增工作樹：${dir}`, 'ok');
+  if (v.open) await openRepoAt(dir, basename(dir));
+  else await loadBranches();
+}
+
+async function removeWorktreeFlow(w) {
+  const c = await choose(`移除工作樹 ${w.path}？`, ['移除', '強制移除（捨棄裡面未提交的變更）', '取消'], { type: 'warning', detail: `會刪除這個資料夾；分支 ${w.branch || ''} 與它的提交會保留。有未提交的變更時一般移除會失敗。` });
+  if (c === 2) return;
+  await api('worktree:remove', { dir: w.path, force: c === 1 });
+  notice('已移除工作樹', 'ok');
+  await loadBranches();
 }
 
 /* ───────────── 衝突解決 ───────────── */
@@ -2202,14 +3354,18 @@ const ACTIONS = {
   removeRepo: removeRepoFlow,
   renameRepo: renameRepoFlow,
   revealRepo: () => api('reveal'),
+  openTerminal: () => api('openTerminal'),
   copyPath: () => copyText(repo().root),
   identity: () => identityFlow(),
   fetch: fetchFlow,
-  pull: pullFlow,
-  push: () => pushFlow(),
+  pull: () => pullDialog(),
+  push: () => pushDialog(),
   newBranch: () => newBranchFlow(),
   mergeInto: () => mergeFlow(),
   stashPush: stashFlow,
+  reflog: () => openReflog(),
+  worktreeAdd: () => (st.worktrees ? addWorktreeFlow() : loadExtras().then(addWorktreeFlow)),
+  submoduleUpdate: () => submoduleUpdateFlow(),
   refresh: refreshAll,
   clearOut: () => { $('#outList').innerHTML = ''; },
   closeOut: () => toggleOutput(false),
@@ -2220,12 +3376,16 @@ const ACTIONS = {
 async function init() {
   st.diffMode = store.get('diffMode', 'sbs');
   st.graphAll = store.get('graphAll', true);
+  st.diffWs = store.get('diffWs', false);
+  st.diffWrap = store.get('diffWrap', true);
+  st.commitOpts = { ...st.commitOpts, ...store.get('commitOpts', {}) };
   initSplit();
   initChanges();
   initBranches();
   initStashes();
   initTabs();
   initSsh();
+  initRebase();
 
   // 線圖分頁固定在第一個
   const g = { kind: 'graph', fixed: true, title: '⑂ 線圖', tip: '分支線圖與提交歷史' };
@@ -2233,7 +3393,7 @@ async function init() {
   addTab(g);
 
   document.addEventListener('click', (e) => {
-    if (!e.target.closest('.menu') && !e.target.closest('.menu-wrap > button') && !e.target.closest('#branchBtn') && !e.target.closest('[data-act="mergeInto"]') && !e.target.closest('[data-ssh="keyMenu"]')) closeMenus();
+    if (!e.target.closest('.menu') && !e.target.closest('.menu-wrap > button') && !e.target.closest('#branchBtn') && !e.target.closest('[data-act="mergeInto"]') && !e.target.closest('[data-ssh="keyMenu"]') && !e.target.closest('[data-menu]')) closeMenus();
     const a = e.target.closest('[data-act]');
     if (a && !a.closest('.view') && !a.closest('#modal') && ACTIONS[a.dataset.act]) {
       closeMenus();
@@ -2255,7 +3415,9 @@ async function init() {
   for (const b of $$('#sideTabs button')) b.onclick = () => setSide(b.dataset.side);
   $('#commitBtn').onclick = () => commitFlow().catch(fail);
   $('#amend').onchange = () => onAmendToggle().catch(fail);
-  $('#msg').addEventListener('input', () => { st.msgTouched = true; });
+  $('#msg').addEventListener('input', () => { st.msgTouched = true; renderMsgLen(); });
+  $('#commitOpts').onclick = commitOptsMenu;
+  $('#msgHist').onclick = msgHistMenu;
   $('#msg').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); commitFlow().catch(fail); }
   });

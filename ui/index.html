@@ -24,10 +24,15 @@
         <button class="ib" id="repoMenuBtn" title="儲存庫選項">⋯</button>
         <div class="menu right" id="repoMenu" hidden>
           <button class="item" data-act="revealRepo">在檔案管理員中顯示</button>
+          <button class="item" data-act="openTerminal">在終端機開啟</button>
           <button class="item" data-act="copyPath">複製路徑</button>
           <button class="item" data-act="renameRepo">重新命名…</button>
           <button class="item" data-act="identity">設定提交者名稱與 email…</button>
           <button class="item" data-act="sshKeys">SSH 金鑰（這個儲存庫使用哪一把）…</button>
+          <div class="sep"></div>
+          <button class="item" data-act="reflog">參照紀錄（reflog）：找回不見的提交</button>
+          <button class="item" data-act="worktreeAdd">新增工作樹（worktree）…</button>
+          <button class="item" data-act="submoduleUpdate">更新所有子模組</button>
           <div class="sep"></div>
           <button class="item" data-act="openIn" id="openInItem" hidden>在其他工具開啟…</button>
           <button class="item" data-act="shareFile" title="存成 .tdx 交換檔，對方在 ToolDock 開啟後就能複製這個專案">分享專案（存成交換檔）…</button>
@@ -48,12 +53,21 @@
         <div class="cbrow">
           <button id="commitBtn" title="提交已暫存的變更">✓ 提交</button>
           <label class="chk" title="把已暫存的變更併入上一次提交，並可修改訊息"><input type="checkbox" id="amend"> 修正上一次提交</label>
+          <span class="sp"></span>
+          <span id="msgLen" title="摘要（第一行）的字數，建議不超過 72"></span>
+          <button class="ib sm" id="msgHist" data-menu title="最近使用的提交訊息">🕘</button>
+          <button class="ib sm" id="commitOpts" data-menu title="提交選項">⚙</button>
         </div>
+      </div>
+      <div class="fbar">
+        <input type="search" id="chgFilter" placeholder="篩選檔案" spellcheck="false">
+        <button class="ib sm" id="chgView" title="切換清單／樹狀檢視">☰</button>
       </div>
       <div id="changes" class="list" tabindex="0"></div>
     </section>
 
     <section id="branchesPane" class="pane" hidden>
+      <div class="fbar"><input type="search" id="brFilter" placeholder="篩選分支、標籤" spellcheck="false"></div>
       <div id="branches" class="list"></div>
     </section>
 
@@ -116,6 +130,15 @@
     <div id="sshBox" role="dialog" aria-labelledby="sshTitle">
       <div class="sshHead"><span id="sshTitle">🔑 SSH 金鑰</span><button type="button" class="ib" data-ssh="close" title="關閉（Esc）">✕</button></div>
       <div id="sshBody"></div>
+    </div>
+  </div>
+
+  <div id="rbPanel" class="panel" hidden>
+    <div class="pbox" role="dialog" aria-labelledby="rbTitle">
+      <div class="phead"><span id="rbTitle">互動式重定基底</span><button type="button" class="ib" data-rb="close" title="關閉（Esc）">✕</button></div>
+      <div class="pdesc" id="rbDesc"></div>
+      <div id="rbList"></div>
+      <div class="pfoot"><span id="rbHint"></span><span class="sp"></span><button type="button" class="secondary" data-rb="close">取消</button><button type="button" data-rb="start">開始重定基底</button></div>
     </div>
   </div>
 

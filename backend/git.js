@@ -77,6 +77,8 @@ function explain(stderr = '', stdout = '') {
     [/has no upstream branch/i, 'NO_UPSTREAM', '目前分支還沒有遠端分支'],
     [/would be overwritten by (merge|checkout)|Your local changes to the following files would be overwritten|commit your changes or stash them/i, 'DIRTY',
       '有尚未提交的變更會被覆蓋。請先提交或儲藏（stash）這些變更'],
+    [/cannot rebase: (You have unstaged changes|Your index contains uncommitted changes)|cannot (rebase|pull with rebase): You have unstaged changes/i, 'DIRTY',
+      '有尚未提交的變更，無法重定基底。請先提交或儲藏（stash）這些變更'],
     [/untracked working tree files would be (overwritten|removed)/i, 'DIRTY', '有未追蹤的檔案會被覆蓋。請先移走、加入或儲藏這些檔案'],
     [/You have not concluded your merge|MERGE_HEAD exists|you need to resolve your current index first|Merging is not possible because you have unmerged files|Committing is not possible because you have unmerged files/i, 'UNMERGED',
       '還有未解決的衝突或未完成的合併。請先解決衝突並完成合併，或中止合併'],
@@ -381,10 +383,17 @@ function isBinary(buf) {
   return false;
 }
 
-/** Buffer → 文字；記錄 BOM，二進位或過大時回傳說明 */
-function decode(buf) {
+const IMAGE_TYPES = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', ico: 'image/x-icon' };
+const MAX_IMAGE = 5 * 1024 * 1024;
+
+/** Buffer → 文字；記錄 BOM，二進位或過大時回傳說明。rel 是圖片時附上 data URL（圖片差異用） */
+function decode(buf, rel = '') {
   if (buf.length > MAX_BLOB) return { text: '', tooLarge: true, note: `檔案超過 ${MAX_BLOB / 1024 / 1024} MB，不顯示內容` };
-  if (isBinary(buf)) return { text: '', binary: true, note: '二進位檔案' };
+  if (isBinary(buf)) {
+    const type = IMAGE_TYPES[(/\.([^./]+)$/.exec(rel) || [])[1]?.toLowerCase()];
+    if (type && buf.length <= MAX_IMAGE) return { text: '', binary: true, image: `data:${type};base64,${buf.toString('base64')}`, size: buf.length, note: '圖片' };
+    return { text: '', binary: true, size: buf.length, note: '二進位檔案' };
+  }
   let s = buf;
   let bom = false;
   if (s[0] === 0xef && s[1] === 0xbb && s[2] === 0xbf) { s = s.subarray(3); bom = true; }
@@ -401,7 +410,7 @@ function readWorking(top, rel) {
     const st = fs.statSync(f);
     if (st.isDirectory()) return { exists: true, text: '', note: '子模組或資料夾', binary: true };
     if (st.size > MAX_BLOB) return { exists: true, text: '', tooLarge: true, note: `檔案超過 ${MAX_BLOB / 1024 / 1024} MB，不顯示內容` };
-    return { exists: true, ...decode(fs.readFileSync(f)) };
+    return { exists: true, ...decode(fs.readFileSync(f), rel) };
   } catch {
     return { exists: false, text: '' };
   }

@@ -339,9 +339,102 @@
     return { added, removed };
   }
 
+  /** 忽略空白比對用：去掉行首尾空白、連續空白視為一個 */
+  const normWs = (l) => l.trim().replace(/\s+/g, ' ');
+
+  /* ───────────── 逐行暫存 ───────────── */
+
+  /** 與 toLines 一一對應、保留行尾字元的行（\r\n、\r、\n 都算一行） */
+  function rawLines(text) {
+    if (!text) return [];
+    return String(text).match(/[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+$/g) || [];
+  }
+
+  /** 內容的簡短雜湊（FNV-1a 32 位元），用來確認畫面看到的內容和檔案目前的內容相同 */
+  function textHash(s) {
+    let h = 0x811c9dc5;
+    const str = String(s == null ? '' : s);
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return `${str.length.toString(36)}-${h.toString(36)}`;
+  }
+
+  /** 文字中最常用的行尾；沒有換行時回傳 null */
+  function dominantEol(text) {
+    const s = String(text || '');
+    const crlf = (s.match(/\r\n/g) || []).length;
+    const lf = (s.match(/\n/g) || []).length - crlf;
+    const cr = (s.match(/\r(?!\n)/g) || []).length;
+    if (!crlf && !lf && !cr) return null;
+    return crlf >= lf && crlf >= cr ? '\r\n' : lf >= cr ? '\n' : '\r';
+  }
+
+  /**
+   * 從 a（舊）到 b（新）的比對中，只套用一部分變更：
+   *   del：要套用的刪除（a 的行索引）　add：要套用的新增（b 的行索引）
+   *   invert：改成「套用沒有選取的變更」（取消暫存、捨棄用：把選取的變更退回去）
+   *   target：結果要寫回哪一側（'a' 或 'b'）。沒有變更的行取自這一側，另一側的行轉成這一側的行尾
+   * 回傳結果文字（不含 BOM）。
+   */
+  function applyPartial(aText, bText, { del = [], add = [], invert = false, target = 'a' } = {}) {
+    const aRaw = rawLines(aText), bRaw = rawLines(bText);
+    const ops = diffLines(toLines(aText), toLines(bText));
+    const D = new Set(del), A = new Set(add);
+    const pick = (op) => (op.t === '-' ? D.has(op.a) : A.has(op.b)) !== invert;
+    const own = target === 'b' ? 'b' : 'a';
+    const eol = dominantEol(own === 'a' ? aText : bText) || dominantEol(own === 'a' ? bText : aText) || '\n';
+    const foreign = (line) => line.replace(/(\r\n|\r|\n)$/, eol);
+    const out = [];
+    for (const op of ops) {
+      if (op.t === '=') out.push(own === 'a' ? aRaw[op.a] : bRaw[op.b]);
+      else if (op.t === '-') { if (!pick(op)) out.push(own === 'a' ? aRaw[op.a] : foreign(aRaw[op.a])); } else if (pick(op)) out.push(own === 'b' ? bRaw[op.b] : foreign(bRaw[op.b]));
+    }
+    // 原本在檔尾、沒有換行的行被接到中間時補上換行
+    for (let i = 0; i < out.length - 1; i++) if (!/[\r\n]$/.test(out[i])) out[i] += eol;
+    return out.join('');
+  }
+
+  /** 選取的變更是否涵蓋全部變更（是的話改用整個檔案的操作） */
+  function coversAll(aText, bText, { del = [], add = [] } = {}) {
+    const D = new Set(del), A = new Set(add);
+    return diffLines(toLines(aText), toLines(bText)).every((op) => op.t === '=' || (op.t === '-' ? D.has(op.a) : A.has(op.b)));
+  }
+
+  /* ───────────── 樹狀檢視 ───────────── */
+
+  /**
+   * 依「/」把項目分成資料夾：{ name, path, dirs: [節點], items: [項目] }。
+   * 只有一個子資料夾、沒有項目的資料夾併成一層（a/b/c）。key(item) 取得路徑。
+   */
+  function buildTree(items, key = (x) => x.path) {
+    const root = { name: '', path: '', dirs: new Map(), items: [] };
+    for (const it of items) {
+      const parts = String(key(it)).split('/');
+      parts.pop();
+      let node = root;
+      for (const p of parts) {
+        if (!node.dirs.has(p)) node.dirs.set(p, { name: p, path: node.path ? `${node.path}/${p}` : p, dirs: new Map(), items: [] });
+        node = node.dirs.get(p);
+      }
+      node.items.push(it);
+    }
+    const finish = (n) => {
+      let dirs = [...n.dirs.values()].map(finish).sort((x, y) => x.name.localeCompare(y.name));
+      dirs = dirs.map((d) => {
+        let c = d;
+        while (c.dirs.length === 1 && !c.items.length) c = { ...c.dirs[0], name: `${c.name}/${c.dirs[0].name}` };
+        return c;
+      });
+      return { name: n.name, path: n.path, dirs, items: n.items };
+    };
+    return finish(root);
+  }
 
   return {
     escapeHtml, layoutGraph, parseConflicts, resolveConflicts, resolved, hasMarkers, sideNames, splitKeep,
     formatDate, ago, toLines, diffLines, sideBySide, unified, fold, diffStats,
+    normWs, rawLines, textHash, dominantEol, applyPartial, coversAll, buildTree,
   };
 }));

@@ -6,6 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const G = require('./git');
+const C = require('../ui/git-core');
 
 const { safeRel, safePaths, safeRef, chunk } = G;
 
@@ -65,6 +66,12 @@ async function status(git, top) {
   const remotes = G.parseRemotes(await git.text(['remote', '-v'], top, { quiet: true }));
   const state = opState(dir);
   const g = G.group(st.entries);
+  // 假設未變更的檔案：git ls-files -v 以小寫字母標示
+  let assumed = [];
+  try {
+    assumed = (await git.text(['ls-files', '-v', '-z'], top, { quiet: true })).split('\0')
+      .filter((r) => /^[a-z] /.test(r)).map((r) => ({ path: r.slice(2), status: 'h', label: '假設未變更' }));
+  } catch { /* 忽略 */ }
   return {
     top,
     gitDir: dir,
@@ -80,6 +87,7 @@ async function status(git, top) {
     state,
     mergeMessage: state ? mergeMessage(dir) : '',
     ...g,
+    assumed,
   };
 }
 
@@ -87,7 +95,7 @@ async function status(git, top) {
 
 async function blob(git, top, rev, rel) {
   try {
-    return { exists: true, ...G.decode((await git(['cat-file', 'blob', `${rev}:${rel}`], top, { quiet: true })).stdout) };
+    return { exists: true, ...G.decode((await git(['cat-file', 'blob', `${rev}:${rel}`], top, { quiet: true })).stdout, rel) };
   } catch {
     return { exists: false, text: '' };
   }
@@ -133,9 +141,22 @@ async function diffSides(git, top, { area, path: p, orig }) {
 
 /* ───────────── 歷史與線圖 ───────────── */
 
-async function log(git, top, { limit = 300, skip = 0, all = true } = {}) {
+/**
+ * 線圖的提交。search：{ mode, text } 在 git 端搜尋全部歷史：
+ *   content  檔案內容中出現次數改變的提交（-S）　message  提交訊息　author  作者名稱或 email
+ */
+async function log(git, top, { limit = 300, skip = 0, all = true, search } = {}) {
   const n = Math.max(1, Math.min(5000, Number(limit) || 300));
   const args = ['log', '-z', `--format=${G.LOG_FORMAT}`, '--decorate=full', '--date-order', `--max-count=${n + 1}`, `--skip=${Math.max(0, Number(skip) || 0)}`];
+  if (search && String(search.text || '').trim()) {
+    const t = String(search.text).trim();
+    // eslint-disable-next-line no-control-regex
+    if (/[\0\n\r]/.test(t)) throw new Error('搜尋文字不能換行');
+    if (search.mode === 'content') args.push(`-S${t}`);
+    else if (search.mode === 'message') args.push(`--grep=${t}`, '--fixed-strings', '--regexp-ignore-case');
+    else if (search.mode === 'author') args.push(`--author=${t}`, '--fixed-strings', '--regexp-ignore-case');
+    else throw new Error('不支援的搜尋方式');
+  }
   if (all) args.push('--branches', '--remotes', '--tags');
   args.push('HEAD', '--');
   let text;
@@ -193,6 +214,157 @@ async function commitDiff(git, top, { hash, parent, path: p, orig }) {
   };
 }
 
+/** 提交存成 patch 的內容（git format-patch -1 --stdout） */
+async function formatPatch(git, top, { hash }) {
+  safeHash(hash);
+  return (await git(['format-patch', '-1', '--stdout', '--no-signature', hash, '--'], top, { quiet: true })).stdout;
+}
+
+/** 提交與目前工作目錄的差異（只含已追蹤的檔案） */
+async function compareWorking(git, top, { hash }) {
+  safeHash(hash);
+  return G.parseNameStatus(await git.text(['diff', '--name-status', '-z', '-M', hash, '--'], top, { quiet: true }));
+}
+
+async function compareWorkingDiff(git, top, { hash, path: p, orig }) {
+  safeHash(hash);
+  const rel = safeRel(top, p);
+  const o = orig ? safeRel(top, orig) : '';
+  const left = await blob(git, top, hash, o || rel);
+  const right = G.readWorking(top, rel);
+  return { path: rel, left: { ...left, label: `${hash.slice(0, 7)}${o ? `：${o}` : ''}` }, right: { ...right, label: '工作目錄' } };
+}
+
+/* ───────────── 參照紀錄、比較、子模組、工作樹 ───────────── */
+
+/** HEAD 的參照紀錄（reflog）：切換、提交、重設、重定基底……都會留下紀錄，可以用來找回不見的提交 */
+async function reflog(git, top, { limit = 300 } = {}) {
+  const n = Math.max(1, Math.min(2000, Number(limit) || 300));
+  let text = '';
+  try {
+    text = await git.text(['log', '-g', '-z', `--max-count=${n}`, '--format=%H%x1f%gd%x1f%gs%x1f%ct%x1f%s', 'HEAD', '--'], top, { quiet: true });
+  } catch { return []; }
+  return text.split('\0').filter((r) => r.trim()).map((r) => {
+    const [hash, ref, action, ct, subject] = r.replace(/^\n/, '').split('\x1f');
+    return { hash, ref, action: action || '', time: Number(ct) * 1000, subject: subject || '' };
+  });
+}
+
+/** 兩個提交之間變更的檔案（from → to） */
+async function compareRange(git, top, { from, to }) {
+  safeHash(from);
+  safeHash(to);
+  return G.parseNameStatus(await git.text(['diff', '--name-status', '-z', '-M', from, to, '--'], top, { quiet: true }));
+}
+
+/** 子模組：git submodule status --recursive */
+async function submodules(git, top) {
+  if (!fs.existsSync(path.join(top, '.gitmodules'))) return [];
+  let text = '';
+  try { text = await git.text(['-c', 'core.quotePath=false', 'submodule', 'status', '--recursive'], top, { quiet: true }); } catch { return []; }
+  const STATE = { ' ': 'ok', '-': 'uninit', '+': 'changed', U: 'conflict' };
+  return text.split('\n').filter(Boolean).map((l) => {
+    const m = /^([ +\-U])([0-9a-f]+) (.+?)(?: \((.*)\))?$/.exec(l);
+    return m ? { state: STATE[m[1]] || 'ok', hash: m[2], path: m[3], describe: m[4] || '' } : null;
+  }).filter(Boolean);
+}
+
+async function submoduleUpdate(git, top, { path: p } = {}, net) {
+  const args = ['submodule', 'update', '--init', '--recursive', '--progress'];
+  if (p) args.push('--', safeRel(top, p));
+  await git(args, top, net);
+}
+
+/** 工作樹：git worktree list --porcelain */
+async function worktrees(git, top) {
+  let text = '';
+  try { text = await git.text(['worktree', 'list', '--porcelain'], top, { quiet: true }); } catch { return []; }
+  const out = [];
+  for (const block of text.split(/\n\n+/)) {
+    const w = {};
+    for (const l of block.split('\n')) {
+      const sp = l.indexOf(' ');
+      const k = sp < 0 ? l : l.slice(0, sp), v = sp < 0 ? '' : l.slice(sp + 1);
+      if (k === 'worktree') w.path = path.resolve(v);
+      else if (k === 'HEAD') w.hash = v;
+      else if (k === 'branch') w.branch = v.replace(/^refs\/heads\//, '');
+      else if (k === 'detached') w.detached = true;
+      else if (k === 'bare') w.bare = true;
+      else if (k === 'locked') w.locked = true;
+      else if (k === 'prunable') w.prunable = true;
+    }
+    if (w.path) out.push({ ...w, main: !out.length, current: path.resolve(top) === w.path });
+  }
+  return out;
+}
+
+/** 新增工作樹：branch 為既有分支；newBranch 為要建立的新分支（從 from 或 HEAD） */
+async function addWorktree(git, top, { dir, branch, newBranch, from }) {
+  if (typeof dir !== 'string' || !path.isAbsolute(dir)) throw new Error('請選擇工作樹的資料夾');
+  if (fs.existsSync(dir) && fs.readdirSync(dir).length) throw new Error(`${dir} 已經存在而且不是空的`);
+  if (newBranch) {
+    await validBranchName(git, top, newBranch);
+    await git(['worktree', 'add', '-b', newBranch, dir, ...(from ? [safeRef(from, '起點')] : [])], top);
+  } else {
+    safeRef(branch, '分支名稱');
+    await git(['worktree', 'add', dir, branch], top);
+  }
+  return path.resolve(dir);
+}
+
+async function removeWorktree(git, top, { dir, force = false }) {
+  const list = await worktrees(git, top);
+  const w = list.find((x) => x.path === path.resolve(String(dir || '')));
+  if (!w) throw new Error('找不到這個工作樹');
+  if (w.main) throw new Error('不能移除主要的工作樹');
+  await git(['worktree', 'remove', ...(force ? ['--force'] : []), w.path], top);
+}
+
+/* ───────────── 檔案歷史與逐行追溯 ───────────── */
+
+/** 一個檔案的提交歷史（跟著重新命名）：每筆附上當時的路徑與變更類型 */
+async function fileHistory(git, top, { path: p, limit = 500 }) {
+  const rel = safeRel(top, p);
+  const n = Math.max(1, Math.min(5000, Number(limit) || 500));
+  const text = await git.text(['-c', 'core.quotePath=false', 'log', '--follow', `--max-count=${n}`, '--format=%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s', '--name-status', '-M', '--', rel], top, { quiet: true });
+  const out = [];
+  for (const rec of text.split('\x1e')) {
+    if (!rec.trim()) continue;
+    const [head, ...rest] = rec.split('\n');
+    const [hash, parents, author, email, at, subject] = head.split('\x1f');
+    const line = rest.find((l) => /^[A-Z]\d*\t/.test(l)) || '';
+    const parts = line.split('\t');
+    const status = (parts[0] || 'M')[0];
+    const item = { hash, parents: parents ? parents.split(' ') : [], author, email, time: Number(at) * 1000, subject: subject || '', status, path: parts[parts.length - 1] || rel };
+    if ((status === 'R' || status === 'C') && parts.length >= 3) item.orig = parts[1];
+    out.push(item);
+  }
+  return out;
+}
+
+/** git blame --porcelain：每一行的提交與內容；rev 為空時以工作目錄為準（未提交的行 hash 為 0） */
+async function blame(git, top, { path: p, rev = '' }) {
+  const rel = safeRel(top, p);
+  if (rev) safeHash(rev);
+  const buf = (await git(['blame', '--porcelain', ...(rev ? [rev] : []), '--', rel], top, { quiet: true })).stdout;
+  if (buf.includes(0)) throw new Error('二進位檔案無法逐行追溯');
+  const commits = {};
+  const lines = [];
+  let cur = null;
+  for (const l of buf.toString('utf8').split('\n')) {
+    if (l.startsWith('\t')) { lines.push({ hash: cur, text: l.slice(1).replace(/\r$/, '') }); continue; }
+    const m = /^([0-9a-f]{40,64}) \d+ \d+/.exec(l);
+    if (m) { cur = m[1]; if (!commits[cur]) commits[cur] = { hash: cur }; continue; }
+    const sp = l.indexOf(' ');
+    if (!cur || sp < 0) continue;
+    const k = l.slice(0, sp), v = l.slice(sp + 1);
+    if (k === 'author') commits[cur].author = v;
+    else if (k === 'author-time') commits[cur].time = Number(v) * 1000;
+    else if (k === 'summary') commits[cur].summary = v;
+  }
+  return { path: rel, lines, commits };
+}
+
 /* ───────────── 暫存與提交 ───────────── */
 
 async function stage(git, top, paths) {
@@ -215,16 +387,105 @@ async function unstageAll(git, top, { noCommits } = {}) {
   else await git(['reset', '-q'], top);
 }
 
+/* ───────────── 逐區塊、逐行暫存 ───────────── */
+
+/** 檔案在暫存區（rev 為空）或某個提交中的權限；找不到時回傳空字串 */
+async function fileMode(git, top, rev, rel) {
+  try {
+    const text = rev
+      ? await git.text(['ls-tree', rev, '--', rel], top, { quiet: true })
+      : await git.text(['ls-files', '-s', '--', rel], top, { quiet: true });
+    const m = text.match(/^(\d{6}) /);
+    return m ? m[1] : '';
+  } catch {
+    return '';
+  }
+}
+
+const withBom = (text, bom) => {
+  const body = Buffer.from(text, 'utf8');
+  return bom ? Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), body]) : body;
+};
+
+/**
+ * 只暫存、取消暫存或捨棄一部分的行：
+ *   area     'unstaged' | 'untracked'（stage、discard）或 'staged'（unstage）
+ *   del/add  選取的刪除行（左側行索引）與新增行（右側行索引），對應 diffSides 的兩側與 GitCore.diffLines 的結果
+ *   check    畫面看到的兩側內容雜湊（GitCore.textHash），檔案在這段期間被改過時拒絕
+ * 選取涵蓋全部變更時改用整個檔案的操作。寫入暫存區時保留檔案權限與 BOM，行尾以寫入的那一側為準。
+ */
+async function partial(git, top, { area, action, path: p, del = [], add = [], check }) {
+  const rel = safeRel(top, p);
+  const ok = { unstaged: ['stage', 'discard'], untracked: ['stage', 'discard'], staged: ['unstage'] }[area];
+  if (!ok || !ok.includes(action)) throw new Error('不支援的操作');
+  if (!Array.isArray(del) || !Array.isArray(add) || ![...del, ...add].every((n) => Number.isInteger(n) && n >= 0)) throw new Error('選取的行不正確');
+  if (!del.length && !add.length) throw new Error('沒有選取任何變更');
+  const st = await status(git, top);
+  const entry = (st[area] || []).find((e) => e.path === rel);
+  if (!entry) throw new Error('檔案的狀態已經改變，請重新整理');
+  if (area === 'staged' && entry.orig) throw new Error('重新命名的檔案只能整個取消暫存');
+  const d = await diffSides(git, top, { area, path: rel });
+  const L = d.left, R = d.right;
+  if (L.binary || R.binary || L.tooLarge || R.tooLarge || L.readOnly || R.readOnly) throw new Error('這個檔案不能逐行操作（二進位、過大或不是 UTF-8）');
+  if (check !== `${C.textHash(L.text)}:${C.textHash(R.text)}`) throw new Error('檔案在這段期間被修改過，請重新整理後再選取');
+
+  if (C.coversAll(L.text, R.text, { del, add }) && !(area === 'untracked' && action === 'discard')) {
+    if (action === 'stage') await stage(git, top, [rel]);
+    else if (action === 'unstage') await unstage(git, top, [rel], { noCommits: st.noCommits });
+    else await discard(git, top, { tracked: [rel] });
+    return { whole: true };
+  }
+
+  if (action === 'discard') {
+    const text = C.applyPartial(L.text, R.text, { del, add, invert: true, target: 'b' });
+    fs.writeFileSync(path.join(top, rel), withBom(text, R.bom));
+    return { whole: false };
+  }
+
+  // 寫入暫存區：暫存以左側（暫存區）為準；取消暫存以右側（暫存區）為準
+  const target = action === 'stage' ? 'a' : 'b';
+  const text = C.applyPartial(L.text, R.text, { del, add, invert: action === 'unstage', target });
+  const own = target === 'a' ? L : R;
+  const bom = own.exists ? own.bom : (L.bom || R.bom);
+  let mode = await fileMode(git, top, '', rel) || await fileMode(git, top, 'HEAD', rel);
+  if (!mode) {
+    try { mode = fs.statSync(path.join(top, rel)).mode & 0o111 ? '100755' : '100644'; } catch { mode = '100644'; }
+  }
+  if (mode !== '100644' && mode !== '100755') throw new Error('這個檔案不能逐行操作（符號連結或子模組）');
+  // 暫存時套用 git 的轉換（core.autocrlf 等），和 git add 的結果一致；取消暫存的內容本來就來自儲存庫
+  const args = action === 'stage' ? ['hash-object', '-w', `--path=${rel}`, '--stdin'] : ['hash-object', '-w', '--no-filters', '--stdin'];
+  const sha = (await git.text(args, top, { input: withBom(text, bom), quiet: true })).trim();
+  if (!/^[0-9a-f]{40,64}$/.test(sha)) throw new Error('無法寫入暫存區');
+  await git(['update-index', '--add', '--cacheinfo', `${mode},${sha},${rel}`], top);
+  return { whole: false };
+}
+
+/** 加入 .gitignore（儲存庫根目錄）；已經有同一行時不重複 */
+function addIgnore(top, { pattern }) {
+  const pat = String(pattern || '').trim();
+  // eslint-disable-next-line no-control-regex
+  if (!pat || /[\0-\x1f]/.test(pat)) throw new Error('忽略規則不正確');
+  const f = path.join(top, '.gitignore');
+  let text = '';
+  try { text = fs.readFileSync(f, 'utf8'); } catch { /* 還沒有 .gitignore */ }
+  if (text.split(/\r?\n/).some((l) => l.trim() === pat)) return { added: false };
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  fs.writeFileSync(f, `${text}${text && !/\n$/.test(text) ? eol : ''}${pat}${eol}`);
+  return { added: true };
+}
+
 /** 捨棄變更：已追蹤的檔案還原成暫存區的內容；未追蹤的檔案刪除 */
 async function discard(git, top, { tracked = [], untracked = [] }) {
   if (tracked.length) for (const part of chunk(safePaths(top, tracked))) await git(['checkout', '-q', '--', ...part], top);
   if (untracked.length) for (const part of chunk(safePaths(top, untracked))) await git(['clean', '-f', '-q', '--', ...part], top);
 }
 
-async function commit(git, top, { message, amend = false, noEdit = false }) {
+async function commit(git, top, { message, amend = false, noEdit = false, noVerify = false, signoff = false }) {
   const msg = String(message || '').replace(/\r\n?/g, '\n').trim();
   const args = ['commit', '--cleanup=strip'];
   if (amend) args.push('--amend');
+  if (noVerify) args.push('--no-verify');
+  if (signoff) args.push('--signoff');
   if (!msg) {
     if (!amend && !noEdit) throw new Error('請輸入提交訊息');
     args.push('--no-edit');
@@ -367,6 +628,31 @@ async function deleteTag(git, top, { name }) {
   await git(['tag', '-d', name], top);
 }
 
+async function remoteNames(git, top) {
+  return G.parseRemotes(await git.text(['remote', '-v'], top, { quiet: true }));
+}
+
+/** 推送一個標籤，或 name 為空時推送全部標籤 */
+async function pushTag(git, top, { remote, name, force = false }, net) {
+  const rn = pickRemote(await remoteNames(git, top), remote);
+  const args = ['push', '--progress'];
+  if (force) args.push('--force');
+  if (name) {
+    safeRef(name, '標籤名稱');
+    await git([...args, rn, `refs/tags/${name}:refs/tags/${name}`], top, net);
+  } else {
+    await git([...args, rn, '--tags'], top, net);
+  }
+  return { remote: rn };
+}
+
+async function deleteRemoteTag(git, top, { remote, name }, net) {
+  safeRef(name, '標籤名稱');
+  const rn = pickRemote(await remoteNames(git, top), remote);
+  await git(['push', '--progress', rn, '--delete', `refs/tags/${name}`], top, net);
+  return { remote: rn };
+}
+
 /** 合併到目前分支；有衝突時回傳 { conflict: true } 而不是丟出錯誤 */
 async function merge(git, top, { ref, noFF = false }) {
   safeRef(ref, '分支');
@@ -391,6 +677,107 @@ async function reset(git, top, { hash, mode }) {
   safeHash(hash);
   if (!['soft', 'mixed', 'hard'].includes(mode)) throw new Error('重設方式不正確');
   await git(['reset', `--${mode}`, '-q', hash, '--'], top);
+}
+
+/* ───────────── 重定基底 ───────────── */
+
+/** sh 的單引號字串（git 以 sh 執行編輯器與 exec，Windows 上是 Git 附帶的 sh） */
+const shq = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+
+async function isAncestor(git, top, a, b) {
+  try { await git(['merge-base', '--is-ancestor', a, b], top, { quiet: true }); return true; } catch { return false; }
+}
+
+/** 把目前分支重定基底到 onto（分支名稱或提交） */
+async function rebaseOnto(git, top, { onto }) {
+  safeRef(onto, '目標');
+  const st = await status(git, top);
+  if (st.detached) throw new Error('目前不在任何分支上（分離的 HEAD），無法重定基底');
+  if (st.state) throw new Error('有進行中的合併，請先完成或中止');
+  return withConflict(git, top, () => git(['rebase', onto], top, { env: { GIT_EDITOR: 'true' } }));
+}
+
+/** 互動式重定基底的提交清單：base（不含）之後到 HEAD，由舊到新 */
+async function rebaseList(git, top, { base }) {
+  safeHash(base);
+  if (!await isAncestor(git, top, base, 'HEAD')) throw new Error('這個提交不在目前分支的歷史中');
+  const merges = (await git.text(['rev-list', '--merges', `${base}..HEAD`], top, { quiet: true })).trim();
+  if (merges) throw new Error('這段歷史中有合併提交，無法互動式重定基底');
+  const text = await git.text(['log', '--reverse', '-z', '--format=%H%x1f%h%x1f%an%x1f%at%x1f%B', `${base}..HEAD`, '--'], top, { quiet: true });
+  return text.split('\0').filter((r) => r.trim()).map((r) => {
+    const [hash, short, author, at, message] = r.replace(/^\n/, '').split('\x1f');
+    return { hash, short, author, time: Number(at) * 1000, message: String(message || '').replace(/\s+$/, ''), subject: String(message || '').split('\n')[0] };
+  });
+}
+
+const REBASE_ACTIONS = new Set(['pick', 'reword', 'squash', 'fixup', 'drop']);
+
+/**
+ * 互動式重定基底：steps 依新的順序列出 base 之後的每個提交 { hash, action, message }。
+ *   pick 保留　reword 改訊息（message）　squash 併入上一個提交（message 為合併後的訊息，空白時合併兩者的訊息）
+ *   fixup 併入上一個提交、捨棄自己的訊息　drop 移除
+ * 以 GIT_SEQUENCE_EDITOR 寫入事先準備好的待辦清單；改訊息以 exec git commit --amend -F 完成，不需要互動的編輯器。
+ */
+async function interactiveRebase(git, top, { base, steps }) {
+  const list = await rebaseList(git, top, { base });
+  if (!Array.isArray(steps) || steps.length !== list.length) throw new Error('提交清單已經改變，請重新開啟');
+  const known = new Set(list.map((c) => c.hash));
+  const seen = new Set();
+  for (const s of steps) {
+    if (!s || !known.has(s.hash) || seen.has(s.hash)) throw new Error('提交清單已經改變，請重新開啟');
+    if (!REBASE_ACTIONS.has(s.action)) throw new Error(`不支援的動作：${s.action}`);
+    seen.add(s.hash);
+  }
+  const kept = steps.filter((s) => s.action !== 'drop');
+  if (kept.length && (kept[0].action === 'squash' || kept[0].action === 'fixup')) throw new Error('第一個保留的提交不能併入上一個提交（squash／fixup）');
+  const st = await status(git, top);
+  if (st.detached) throw new Error('目前不在任何分支上（分離的 HEAD），無法重定基底');
+  if (st.state) throw new Error('有進行中的合併，請先完成或中止');
+
+  const dir = path.join(await gitDir(git, top), 'tooldock-rebase');
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+  const gitBin = git.bin() || 'git';
+  const lines = [];
+  steps.forEach((s, i) => {
+    const msg = String(s.message || '').replace(/\r\n?/g, '\n').trim();
+    const amend = () => {
+      const f = path.join(dir, `msg-${i}.txt`);
+      fs.writeFileSync(f, `${msg}\n`);
+      lines.push(`exec ${shq(gitBin)} commit --amend --allow-empty --no-verify --cleanup=strip -F ${shq(f)}`);
+    };
+    if (s.action === 'reword') {
+      if (!msg) throw new Error('改訊息時訊息不能是空的');
+      lines.push(`pick ${s.hash}`);
+      amend();
+    } else if (s.action === 'squash') {
+      lines.push(`squash ${s.hash}`);
+      if (msg) amend();
+    } else {
+      lines.push(`${s.action} ${s.hash}`);
+    }
+  });
+  const todo = path.join(dir, 'todo.txt');
+  fs.writeFileSync(todo, `${lines.join('\n')}\n`);
+  const env = { GIT_SEQUENCE_EDITOR: `cp ${shq(todo)}`, GIT_EDITOR: 'true' };
+  return withConflict(git, top, () => git(['-c', 'rebase.missingCommitsCheck=ignore', '-c', 'rebase.abbreviateCommands=false', 'rebase', '-i', base], top, { env }));
+}
+
+/** 修改提交訊息：HEAD 直接修正（不帶入暫存的變更），較早的提交以互動式重定基底完成 */
+async function reword(git, top, { hash, message }) {
+  safeHash(hash);
+  const msg = String(message || '').replace(/\r\n?/g, '\n').trim();
+  if (!msg) throw new Error('請輸入提交訊息');
+  const head = (await git.text(['rev-parse', 'HEAD'], top, { quiet: true })).trim();
+  const full = (await git.text(['rev-parse', `${hash}^{commit}`], top, { quiet: true })).trim();
+  if (full === head) {
+    await git(['commit', '--amend', '--only', '--allow-empty', '--no-verify', '--cleanup=strip', '-F', '-'], top, { input: `${msg}\n` });
+    return { conflict: false };
+  }
+  const parents = (await git.text(['rev-list', '--parents', '-n', '1', full], top, { quiet: true })).trim().split(' ').slice(1);
+  if (parents.length !== 1) throw new Error('只能修改有一個父提交的提交訊息（不能是第一個提交或合併提交）');
+  const list = await rebaseList(git, top, { base: parents[0] });
+  return interactiveRebase(git, top, { base: parents[0], steps: list.map((c) => (c.hash === full ? { hash: c.hash, action: 'reword', message: msg } : { hash: c.hash, action: 'pick' })) });
 }
 
 /** 執行可能產生衝突的指令：結束後如果有衝突檔案，視為「需要解決衝突」而不是失敗 */
@@ -443,13 +830,28 @@ function pickRemote(remotes, name) {
   return (remotes.find((r) => r.name === 'origin') || remotes[0]).name;
 }
 
-async function fetchAll(git, top, net) {
+/** 擷取所有遠端；pruneTags 時也刪除遠端已經不存在的本機標籤 */
+async function fetchAll(git, top, net, { pruneTags = false } = {}) {
   const remotes = G.parseRemotes(await git.text(['remote', '-v'], top, { quiet: true }));
   pickRemote(remotes);
-  await git(['fetch', '--all', '--prune', '--progress'], top, net);
+  await git(['fetch', '--all', '--prune', ...(pruneTags ? ['--prune-tags'] : []), '--progress'], top, net);
 }
 
-async function pull(git, top, { mode = 'merge' } = {}, net) {
+/** 遠端有哪些標籤（git ls-remote --tags --refs） */
+async function remoteTags(git, top, { remote }, net) {
+  const rn = pickRemote(await remoteNames(git, top), remote);
+  const text = await git.text(['ls-remote', '--tags', '--refs', rn], top, net);
+  const tags = text.split('\n').map((l) => (/\trefs\/tags\/(.+)$/.exec(l) || [])[1]).filter(Boolean);
+  return { remote: rn, tags };
+}
+
+/** 標示或取消「假設未變更」（git update-index --[no-]assume-unchanged） */
+async function assumeUnchanged(git, top, { paths, on = true }) {
+  for (const part of chunk(safePaths(top, paths))) await git(['update-index', on ? '--assume-unchanged' : '--no-assume-unchanged', '--', ...part], top);
+}
+
+/** 拉取；指定 remote 與 branch 時拉取那個遠端分支（不改變追蹤設定） */
+async function pull(git, top, { mode = 'merge', remote, branch } = {}, net) {
   const st = await status(git, top);
   if (st.detached) throw new Error('目前不在任何分支上（分離的 HEAD），無法拉取');
   if (st.state) throw new Error('有進行中的合併，請先完成或中止');
@@ -457,6 +859,11 @@ async function pull(git, top, { mode = 'merge' } = {}, net) {
   if (mode === 'rebase') args.push('--rebase', '--autostash');
   else if (mode === 'ff-only') args.push('--ff-only');
   else args.push('--no-rebase');
+  if (remote && branch) {
+    pickRemote(st.remotes, remote);
+    safeRef(branch, '分支名稱');
+    return withConflict(git, top, () => git([...args, remote, branch], top, net));
+  }
   if (!st.upstream) {
     const remote = pickRemote(st.remotes);
     const name = st.branch;
@@ -475,22 +882,33 @@ async function pull(git, top, { mode = 'merge' } = {}, net) {
   return withConflict(git, top, () => git(args, top, net));
 }
 
+/**
+ * 推送目前分支。remote 與目前追蹤的遠端不同時改推到那個遠端並設定追蹤。
+ * tags：分支推送成功後也推送所有標籤（git push <remote> --tags）。
+ */
 async function push(git, top, { remote: rn, force = false, tags = false } = {}, net) {
   const st = await status(git, top);
   if (st.detached) throw new Error('目前不在任何分支上（分離的 HEAD），無法推送');
   if (st.noCommits) throw new Error('還沒有任何提交可以推送');
   const args = ['push', '--progress'];
   if (force) args.push('--force-with-lease');
-  if (tags) args.push('--follow-tags');
-  if (st.upstream && !rn) {
+  const upRemote = st.upstream ? st.remotes.map((r) => r.name).filter((r) => st.upstream.startsWith(`${r}/`)).sort((a, b) => b.length - a.length)[0] : '';
+  let res;
+  if (st.upstream && (!rn || rn === upRemote)) {
     await git(args, top, net);
-    return { upstream: st.upstream, created: false };
+    res = { upstream: st.upstream, created: false, remote: upRemote };
+  } else {
+    const remote = pickRemote(st.remotes, rn);
+    safeRef(st.branch, '分支名稱');
+    await git([...args, '-u', remote, `HEAD:refs/heads/${st.branch}`], top, net);
+    await git(['branch', `--set-upstream-to=${remote}/${st.branch}`], top, { quiet: true }).catch(() => {});
+    res = { upstream: `${remote}/${st.branch}`, created: true, remote };
   }
-  const remote = pickRemote(st.remotes, rn);
-  safeRef(st.branch, '分支名稱');
-  await git([...args, '-u', remote, `HEAD:refs/heads/${st.branch}`], top, net);
-  await git(['branch', `--set-upstream-to=${remote}/${st.branch}`], top, { quiet: true }).catch(() => {});
-  return { upstream: `${remote}/${st.branch}`, created: true };
+  if (tags) {
+    await git(['push', '--progress', res.remote || pickRemote(st.remotes, rn), '--tags'], top, net);
+    res.tags = true;
+  }
+  return res;
 }
 
 function checkUrl(url) {
@@ -567,11 +985,13 @@ function safeStash(ref) {
   return ref;
 }
 
-async function stashPush(git, top, { message, untracked = true } = {}) {
+/** 儲藏；paths 有值時只儲藏這些檔案 */
+async function stashPush(git, top, { message, untracked = true, paths } = {}) {
   const args = ['stash', 'push'];
   if (untracked) args.push('--include-untracked');
   const m = String(message || '').trim();
   if (m) args.push('-m', m);
+  if (paths && paths.length) args.push('--', ...safePaths(top, paths));
   const r = await git(args, top);
   if (/No local changes to save/i.test(r.stdout.toString('utf8') + r.stderr)) throw new Error('沒有可以儲藏的變更');
 }
@@ -650,10 +1070,11 @@ async function markResolved(git, top, { path: p, remove = false }) {
 
 module.exports = {
   topLevel, describe, gitDir, opState, status, diffSides, log, commitInfo, commitDiff,
-  stage, unstage, stageAll, unstageAll, discard, commit, identity, setIdentity, sshCommands, setSshCommand,
+  stage, unstage, stageAll, unstageAll, discard, commit, partial, addIgnore, formatPatch, compareWorking, compareWorkingDiff, pushTag, deleteRemoteTag, identity, setIdentity, sshCommands, setSshCommand,
   branches, checkout, createBranch, deleteBranch, renameBranch, deleteRemoteBranch, createTag, deleteTag,
-  merge, cherryPick, revert, reset, abortOp, continueOp,
-  fetchAll, pull, push, addRemote, removeRemote, setRemoteUrl, clone, init, repoNameFromUrl, checkUrl,
+  fileHistory, blame, reflog, compareRange, submodules, submoduleUpdate, worktrees, addWorktree, removeWorktree,
+  merge, cherryPick, revert, reset, abortOp, continueOp, rebaseOnto, rebaseList, interactiveRebase, reword,
+  fetchAll, remoteTags, assumeUnchanged, pull, push, addRemote, removeRemote, setRemoteUrl, clone, init, repoNameFromUrl, checkUrl,
   stashes, stashPush, stashApply, stashDrop, stashFiles,
   conflictInfo, resolveText, takeSide, markResolved,
 };

@@ -14,6 +14,7 @@ const G = require('./git');
 const ops = require('./ops');
 const P = require('./project');
 const S = require('./ssh');
+const T = require('./terminal');
 
 let ctx = null;
 let git = null;
@@ -256,6 +257,17 @@ async function watch(id) {
   } catch { /* 無法監看時只靠畫面的手動重新整理 */ }
 }
 
+/** 把提交存成 .patch 檔（git format-patch -1） */
+async function savePatch(root, hash, subject) {
+  const body = await ops.formatPatch(git, root, { hash });
+  // eslint-disable-next-line no-control-regex
+  const slug = String(subject || '').replace(/[\\/:*?"<>|\x00-\x1f]/g, '').replace(/\s+/g, '-').slice(0, 52) || String(hash).slice(0, 7);
+  const r = await ctx.window.showSaveDialog({ title: '存成 Patch', defaultPath: path.join(os.homedir(), `0001-${slug}.patch`), filters: [{ name: 'Patch', extensions: ['patch', 'diff'] }] });
+  if (!r || r.canceled || !r.filePath) return null;
+  fs.writeFileSync(r.filePath, body);
+  return { filePath: r.filePath };
+}
+
 /* ───────────── 排隊與進度 ───────────── */
 
 /** 會修改儲存庫的操作排隊執行 */
@@ -389,15 +401,32 @@ exports.activate = (context) => {
   h('diff', ({ id, ...o }) => ops.diffSides(git, top(id), o));
   h('log', ({ id, ...o }) => ops.log(git, top(id), { limit: setting('logLimit', 300), ...o }));
   h('commit:info', ({ id, hash }) => ops.commitInfo(git, top(id), hash));
+  h('file:history', ({ id, path: p }) => ops.fileHistory(git, top(id), { path: p }));
+  h('blame', ({ id, ...o }) => ops.blame(git, top(id), o));
+  h('reflog', ({ id }) => ops.reflog(git, top(id)));
+  h('compare:range', ({ id, from, to }) => ops.compareRange(git, top(id), { from, to }));
+  h('submodules', ({ id }) => ops.submodules(git, top(id)));
+  h('worktrees', ({ id }) => ops.worktrees(git, top(id)));
+  h('rebase:list', ({ id, base }) => ops.rebaseList(git, top(id), { base }));
   h('commit:diff', ({ id, ...o }) => ops.commitDiff(git, top(id), o));
   h('branches', ({ id }) => ops.branches(git, top(id)));
   h('stashes', ({ id }) => ops.stashes(git, top(id)));
   h('stash:files', ({ id, ref }) => ops.stashFiles(git, top(id), { ref }));
   h('identity', ({ id }) => ops.identity(git, top(id)));
   h('conflict:info', ({ id, path: p }) => ops.conflictInfo(git, top(id), { path: p }));
+  h('compare:files', ({ id, hash }) => ops.compareWorking(git, top(id), { hash }));
+  h('compare:diff', ({ id, ...o }) => ops.compareWorkingDiff(git, top(id), o));
+  h('savePatch', ({ id, hash, subject }) => savePatch(top(id), hash, subject));
   h('output', () => output.slice());
   h('reveal', ({ id }) => ctx.shell.showItemInFolder(top(id)));
   h('openFile', ({ id, path: p }) => ctx.shell.openPath(path.join(top(id), G.safeRel(top(id), p))));
+  h('openTerminal', ({ id, path: p }) => {
+    const root = top(id);
+    let dir = p ? path.join(root, G.safeRel(root, p)) : root;
+    try { if (!fs.statSync(dir).isDirectory()) dir = path.dirname(dir); } catch { throw new Error('資料夾不存在'); }
+    return T.open(dir, setting('terminal', ''));
+  });
+  h('revealFile', ({ id, path: p }) => ctx.shell.showItemInFolder(path.join(top(id), G.safeRel(top(id), p))));
 
   /* 修改 */
   const ex = (name, title, fn) => h(name, (o) => exclusive(title, () => fn(o)));
@@ -406,7 +435,12 @@ exports.activate = (context) => {
   ex('stageAll', '暫存全部', ({ id }) => ops.stageAll(git, top(id)));
   ex('unstageAll', '取消暫存全部', ({ id, noCommits }) => ops.unstageAll(git, top(id), { noCommits }));
   ex('discard', '捨棄變更', ({ id, tracked, untracked }) => ops.discard(git, top(id), { tracked, untracked }));
-  ex('commit', '提交', ({ id, message, amend }) => ops.commit(git, top(id), { message, amend }));
+  ex('partial', '暫存選取的行', ({ id, ...o }) => ops.partial(git, top(id), o));
+  ex('assume', '假設未變更', ({ id, paths, on }) => ops.assumeUnchanged(git, top(id), { paths, on: on !== false }));
+  ex('worktree:add', '新增工作樹', ({ id, ...o }) => ops.addWorktree(git, top(id), o));
+  ex('worktree:remove', '移除工作樹', ({ id, ...o }) => ops.removeWorktree(git, top(id), o));
+  ex('ignore', '加入 .gitignore', ({ id, pattern }) => ops.addIgnore(top(id), { pattern }));
+  ex('commit', '提交', ({ id, message, amend, noVerify, signoff }) => ops.commit(git, top(id), { message, amend, noVerify: !!noVerify, signoff: !!signoff }));
   ex('setIdentity', '設定身分', ({ id, name, email, global }) => ops.setIdentity(git, top(id), { name, email, global }));
   ex('checkout', '切換', ({ id, ...o }) => ops.checkout(git, top(id), o));
   ex('createBranch', '建立分支', ({ id, ...o }) => ops.createBranch(git, top(id), o));
@@ -418,6 +452,9 @@ exports.activate = (context) => {
   ex('cherryPick', '揀選提交', ({ id, ...o }) => ops.cherryPick(git, top(id), o));
   ex('revert', '還原提交', ({ id, ...o }) => ops.revert(git, top(id), o));
   ex('reset', '重設分支', ({ id, ...o }) => ops.reset(git, top(id), o));
+  ex('rebase', '重定基底', ({ id, ...o }) => ops.rebaseOnto(git, top(id), o));
+  ex('rebase:interactive', '互動式重定基底', ({ id, ...o }) => ops.interactiveRebase(git, top(id), o));
+  ex('reword', '修改提交訊息', ({ id, ...o }) => ops.reword(git, top(id), o));
   ex('abort', '中止', ({ id }) => ops.abortOp(git, top(id)));
   ex('continue', '繼續', ({ id, message }) => ops.continueOp(git, top(id), { message }));
   ex('addRemote', '新增遠端', ({ id, ...o }) => ops.addRemote(git, top(id), o));
@@ -431,9 +468,13 @@ exports.activate = (context) => {
   ex('conflict:mark', '標示已解決', ({ id, ...o }) => ops.markResolved(git, top(id), o));
 
   /* 網路 */
-  h('fetch', ({ id }) => network('擷取', (net) => ops.fetchAll(git, top(id), net)));
-  h('pull', ({ id }) => network('拉取', (net) => ops.pull(git, top(id), { mode: setting('pullMode', 'merge') }, net)));
+  h('fetch', ({ id, pruneTags }) => network('擷取', (net) => ops.fetchAll(git, top(id), net, { pruneTags: !!pruneTags })));
+  h('pull', ({ id, mode, remote, branch }) => network('拉取', (net) => ops.pull(git, top(id), { mode: ['merge', 'rebase', 'ff-only'].includes(mode) ? mode : setting('pullMode', 'merge'), remote, branch }, net)));
+  h('remoteTags', ({ id, remote }) => network('比對遠端標籤', (net) => ops.remoteTags(git, top(id), { remote }, net)));
   h('push', ({ id, ...o }) => network('推送', (net) => ops.push(git, top(id), o, net)));
+  h('submodule:update', ({ id, path: p }) => network('更新子模組', (net) => ops.submoduleUpdate(git, top(id), { path: p }, net)));
+  h('pushTag', ({ id, ...o }) => network(o.name ? '推送標籤' : '推送所有標籤', (net) => ops.pushTag(git, top(id), o, net)));
+  h('deleteRemoteTag', ({ id, ...o }) => network('刪除遠端標籤', (net) => ops.deleteRemoteTag(git, top(id), o, net)));
   h('deleteRemoteBranch', ({ id, ...o }) => network('刪除遠端分支', (net) => ops.deleteRemoteBranch(git, top(id), o, net)));
   h('cancel', () => {
     if (running && running.cancel) { running.cancel(); return true; }
