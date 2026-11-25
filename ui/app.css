@@ -440,3 +440,16 @@ button.sm { min-height: 24px; padding: 0 8px; font-size: 12px; }
 .rrow .sha { flex: none; font-family: var(--mono); color: var(--info); font-size: 11.5px; }
 .rrow .act { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--fg-strong); }
 .rrow .when { flex: none; color: var(--fg-muted); font-size: 11.5px; }
+
+/* 載入中遮罩：一出現就擋住操作，稍等一下才顯示卡片，快的時候不會閃 */
+#loading { position: fixed; inset: 0; z-index: 70; display: none; align-items: center; justify-content: center; cursor: progress; }
+#loading.on { display: flex; animation: loading-dim .2s .15s both; }
+#loading .card { display: flex; align-items: center; gap: 12px; min-width: 240px; max-width: min(520px, 86vw); padding: 14px 18px; background: var(--bg-elevated); border: 1px solid var(--border-strong); border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .3); animation: loading-in .2s .15s both; }
+#loading .t { color: var(--fg-strong); font-size: 13px; }
+#loading .d { margin-top: 2px; color: var(--fg-muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#loading .d:empty { display: none; }
+#loading .spinner { flex: none; width: 18px; height: 18px; border: 2px solid var(--border-strong); border-top-color: var(--accent); border-radius: 50%; animation: loading-spin .8s linear infinite; }
+@keyframes loading-dim { from { background: transparent; } to { background: rgba(0, 0, 0, .25); } }
+@keyframes loading-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@keyframes loading-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { #loading .spinner { animation-duration: 2s; } }

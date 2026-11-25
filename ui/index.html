@@ -7,6 +7,10 @@
   <link rel="stylesheet" href="app.css">
 </head>
 <body>
+  <!-- 載入中：啟動、切換儲存庫、重新整理時蓋住畫面，避免在讀取完成前操作 -->
+  <div id="loading" class="on" role="status" aria-live="polite">
+    <div class="card"><span class="spinner"></span><div><div class="t">正在啟動 Git 工具…</div><div class="d"></div></div></div>
+  </div>
   <aside id="side">
     <div id="repoBar">
       <select id="repoSel" title="切換儲存庫"></select>

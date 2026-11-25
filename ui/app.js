@@ -63,6 +63,55 @@ function notice(msg, kind = '') {
   if (msg) noticeTimer = setTimeout(() => { el.textContent = ''; }, kind === 'err' ? 12000 : 6000);
 }
 
+/* ───────────── 載入中 ───────────── */
+// 啟動、切換儲存庫、重新整理時蓋住畫面並擋下鍵盤，讀取完成前不能操作，避免狀態錯亂。
+// （和 st.busy 不同：st.busy 是 git 指令執行中，顯示在狀態列，不擋畫面。）
+// 可以巢狀（例如啟動時順便開啟上次的儲存庫），全部離開才收起；離開時還原外層的說明文字。
+const loading = {
+  depth: 1, // index.html 的 #loading 預設就是開著的：初始化完成前都算載入中
+  stack: [['正在啟動 Git 工具…', '']],
+  enter(title, detail = '') {
+    if (!this.depth) {
+      const a = document.activeElement;
+      if (a && a !== document.body) a.blur();
+      $('#loading').classList.add('on');
+    }
+    this.depth++;
+    this.stack.push([title, detail]);
+    this.show();
+  },
+  /** 更新目前這一層的進度說明 */
+  step(detail) {
+    const top = this.stack[this.stack.length - 1];
+    if (top) { top[1] = detail || ''; this.show(); }
+  },
+  leave() {
+    if (!this.depth) return;
+    this.depth--;
+    this.stack.pop();
+    if (this.depth) this.show(); else $('#loading').classList.remove('on');
+  },
+  show() {
+    const [title, detail] = this.stack[this.stack.length - 1] || ['', ''];
+    const b = $('#loading');
+    $('.t', b).textContent = title;
+    $('.d', b).textContent = detail;
+  },
+};
+async function withLoading(title, fn) {
+  loading.enter(title);
+  try { return await fn(); } finally { loading.leave(); }
+}
+// 載入中不接受鍵盤（遮罩已經擋住滑鼠）；用 capture 搶在各輸入框與快捷鍵之前
+document.addEventListener('keydown', (e) => {
+  if (!loading.depth) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+}, true);
+/** 初始化完成（設定、儲存庫清單都讀好了）；其他工具送來的指令要等這個才執行 */
+let markReady;
+const ready = new Promise((r) => { markReady = r; });
+
 /** 後端錯誤格式：「[代碼] 訊息」 */
 function errInfo(err) {
   const s = String((err && err.message) || err || '');
@@ -253,7 +302,19 @@ function renderRepoSel() {
   $('#stRepo').title = r ? r.root : '';
 }
 
-async function selectRepo(id) {
+/** 切換儲存庫：一次只跑一個，連續切換會排隊依序處理，不會兩個儲存庫的資料混在一起 */
+let selectChain = Promise.resolve();
+function selectRepo(id) {
+  const run = selectChain.then(() => {
+    const r = id && st.repos.find((x) => x.id === id);
+    return withLoading(r ? `正在開啟儲存庫「${r.name}」…` : '正在關閉儲存庫…', () => loadRepo(id));
+  });
+  selectChain = run.catch(() => { /* 錯誤交給呼叫端 */ });
+  return run;
+}
+
+async function loadRepo(id) {
+  loading.step('關閉分頁');
   st.rid = id || null;
   st.status = null;
   st.log = null;
@@ -274,7 +335,10 @@ async function selectRepo(id) {
   renderRepoSel();
   await td.invoke('selectRepo', st.rid);
   updateLayout();
-  if (st.rid) await refreshAll();
+  if (st.rid) {
+    loading.step('讀取狀態、線圖與儲藏');
+    await refreshAll();
+  }
 }
 
 function updateLayout() {
@@ -3366,7 +3430,7 @@ const ACTIONS = {
   reflog: () => openReflog(),
   worktreeAdd: () => (st.worktrees ? addWorktreeFlow() : loadExtras().then(addWorktreeFlow)),
   submoduleUpdate: () => submoduleUpdateFlow(),
-  refresh: refreshAll,
+  refresh: () => (st.rid ? withLoading('正在重新整理…', refreshAll) : null),
   clearOut: () => { $('#outList').innerHTML = ''; },
   closeOut: () => toggleOutput(false),
 };
@@ -3374,6 +3438,17 @@ const ACTIONS = {
 /* ───────────── 啟動 ───────────── */
 
 async function init() {
+  try {
+    await setup();
+  } finally {
+    loading.leave(); // 收起 index.html 預設開著的「正在啟動」
+    markReady();
+  }
+  const pending = await td.invoke('takePending');
+  if (pending) await runCommand(pending);
+}
+
+async function setup() {
   st.diffMode = store.get('diffMode', 'sbs');
   st.graphAll = store.get('graphAll', true);
   st.diffWs = store.get('diffWs', false);
@@ -3450,12 +3525,13 @@ async function init() {
     changedTimer = setTimeout(() => refreshAll(), 300);
   });
   td.on('settingsChanged', ({ settings }) => { if (st.info) st.info.settings = settings; });
-  td.on('command', ({ command }) => { td.invoke('takePending').catch(() => {}); runCommand(command).catch(fail); });
+  // 啟動中收到的指令（例如程式碼編輯器要求開啟專案）等初始化完成再處理
+  td.on('command', ({ command }) => { td.invoke('takePending').catch(() => {}); ready.then(() => runCommand(command)).catch(fail); });
 
   // 回到這個畫面時重新讀取狀態（檔案可能在其他程式中修改過）
   let lastFocus = 0;
   const onBack = () => {
-    if (document.hidden || !st.rid || st.busy || st.progress) return;
+    if (document.hidden || !st.rid || st.busy || st.progress || loading.depth) return;
     const now = Date.now();
     if (now - lastFocus < 1500) return;
     lastFocus = now;
@@ -3463,8 +3539,9 @@ async function init() {
   };
   addEventListener('focus', onBack);
   document.addEventListener('visibilitychange', onBack);
-  setInterval(() => { if (!document.hidden && st.rid && !st.busy && !st.progress && $('#modal').hidden) refresh(); }, 15000);
+  setInterval(() => { if (!document.hidden && st.rid && !st.busy && !st.progress && !loading.depth && $('#modal').hidden) refresh(); }, 15000);
 
+  loading.step('讀取設定與儲存庫清單');
   st.info = await td.invoke('info');
   st.repos = st.info.repos;
   $('#gitVer').textContent = st.info.gitVersion ? st.info.gitVersion : '⚠️ 找不到 git：請先安裝 Git（https://git-scm.com），或在擴充設定中指定 git 執行檔位置。';
@@ -3472,8 +3549,6 @@ async function init() {
   const last = st.repos.find((r) => r.id === st.info.lastRepo) ? st.info.lastRepo : (st.repos[0] && st.repos[0].id);
   await selectRepo(last || null);
   refreshTargets();
-  const pending = await td.invoke('takePending');
-  if (pending) await runCommand(pending);
 }
 
 init().catch(fail);
